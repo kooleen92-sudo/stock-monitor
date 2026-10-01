@@ -1,0 +1,29 @@
+﻿akshare:
+  market: a
+
+paths:
+  data_dir: data
+  output_dir: output
+
+alerts:
+  lookback_years: 10
+  percentile_threshold: 0.20
+
+strategy:
+  mode: strict
+  dividend_yield_threshold: 0.045
+
+schedule:
+  frequency: daily
+  time: "17:00"
+
+email:
+  enabled: true
+  smtp_host: smtp.qq.com
+  smtp_port: 465
+  use_ssl: true
+  username: 247409402@qq.com
+  password_env: STOCK_MONITOR_EMAIL_PASSWORD
+  from_addr: 247409402@qq.com
+  to_addrs:
+    - 247409402@qq.com

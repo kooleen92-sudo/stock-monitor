@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"/c/Users/24740/AppData/Local/Programs/Python/Python312/python.exe\" - <<'PY'\nfrom pathlib import Path\nimport akshare as ak\nimport re\n\npool = Path\\('/d/ProgramData/Backup/xxx/股票池.txt'\\).read_text\\(encoding='utf-8'\\).splitlines\\(\\)\ndef norm\\(raw\\):\n    m = re.search\\(r'\\(\\\\d{6}\\)', raw\\)\n    return m.group\\(1\\) if m else None\n\ncode_name = ak.stock_info_a_code_name\\(\\)\ncode_col = 'code' if 'code' in code_name.columns else '证券代码'\nname_col = 'name' if 'name' in code_name.columns else '名称'\nlookup = dict\\(zip\\(code_name[name_col].astype\\(str\\), code_name[code_col].astype\\(str\\)\\)\\)\nfor line in pool:\n    line = line.strip\\(\\)\n    if not line or line.startswith\\('#'\\):\n        continue\n    if ',' in line or '，' in line:\n        parts = line.replace\\('，', ','\\).split\\(',', 1\\)\n        code = norm\\(parts[0]\\)\n        name = parts[1].strip\\(\\) if len\\(parts\\) > 1 else ''\n    else:\n        name = line\n        code = norm\\(lookup.get\\(name, ''\\)\\)\n    if not code:\n        print\\(line, '-> no code'\\)\n        continue\n    try:\n        info = ak.stock_individual_info_em\\(symbol=code\\)\n        item_map = dict\\(zip\\(info['item'].astype\\(str\\), info['value'].astype\\(str\\)\\)\\)\n        print\\(code, name, '=>', item_map.get\\('行业'\\)\\)\n    except Exception as e:\n        print\\(code, name, '=> error', e\\)\nPY)"
+    ]
+  }
+}

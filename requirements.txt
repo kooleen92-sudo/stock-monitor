@@ -1,0 +1,2 @@
+akshare>=1.14.0
+pyyaml>=6.0.1
