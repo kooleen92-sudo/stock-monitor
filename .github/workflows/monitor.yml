@@ -2,8 +2,8 @@ name: Stock Valuation Monitor
 
 on:
   schedule:
-    # 每天北京时间 17:00 运行 (GitHub 默认使用 UTC 时间，UTC 9:00 即北京 17:00)
-    - cron: '0 9 * * 1-5' # 周一到周五运行
+    # 北京时间每周五上午 7:00 运行 (对应 UTC 时间每周四 23:00)
+    - cron: '0 23 * * 4'
   workflow_dispatch: # 允许你在网页上手动点击按钮立即运行
 
 jobs:
