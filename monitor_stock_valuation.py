@@ -150,10 +150,15 @@ def load_stock_pool(pool_path: Path) -> list[tuple[str, Optional[str], str]]:
     return rows
 
 
-def fetch_stock_basic() -> pd.DataFrame:
-    frame = ak.stock_info_a_code_name()
+def fetch_stock_basic() -> Optional[pd.DataFrame]:
+    try:
+        frame = ak.stock_info_a_code_name()
+    except Exception as exc:
+        logger.warning("AkShare stock_info_a_code_name failed (common on overseas cloud IPs): %s", exc)
+        return None
+
     if frame is None or frame.empty:
-        raise RuntimeError("AkShare stock_info_a_code_name returned no data")
+        return None
 
     rename_map = {}
     if "code" in frame.columns:
@@ -170,7 +175,7 @@ def fetch_stock_basic() -> pd.DataFrame:
 
     frame = frame.rename(columns=rename_map)
     if "symbol_code" not in frame.columns or "display_name" not in frame.columns:
-        raise RuntimeError(f"Unexpected columns from stock_info_a_code_name: {list(frame.columns)}")
+        return None
 
     frame = frame[["symbol_code", "display_name"]].copy()
     frame["symbol_code"] = frame["symbol_code"].map(normalize_symbol_code)
@@ -182,19 +187,28 @@ def fetch_stock_basic() -> pd.DataFrame:
 
 def resolve_symbols(
     pool_rows: list[tuple[str, Optional[str], str]],
-    stock_basic: pd.DataFrame,
+    stock_basic: Optional[pd.DataFrame],
 ) -> tuple[list[SymbolRecord], list[str]]:
     resolved: list[SymbolRecord] = []
     issues: list[str] = []
-    by_code = stock_basic.drop_duplicates(subset=["symbol_code"]).set_index("symbol_code")
+    by_code = (
+        stock_basic.drop_duplicates(subset=["symbol_code"]).set_index("symbol_code")
+        if stock_basic is not None and not stock_basic.empty
+        else None
+    )
 
     for display_name, explicit_code, source_line in pool_rows:
         if explicit_code:
-            if explicit_code not in by_code.index:
-                issues.append(f"{source_line} -> code not found in A-share list")
-                continue
-            matched_name = str(by_code.loc[explicit_code, "display_name"])
+            matched_name = (
+                str(by_code.loc[explicit_code, "display_name"])
+                if by_code is not None and explicit_code in by_code.index
+                else display_name
+            )
             resolved.append(SymbolRecord(symbol_code=explicit_code, display_name=display_name or matched_name))
+            continue
+
+        if stock_basic is None or stock_basic.empty:
+            issues.append(f"{display_name} -> stock basic list unavailable to resolve code")
             continue
 
         matches = stock_basic[stock_basic["display_name"] == display_name].copy()
@@ -1011,6 +1025,7 @@ def main() -> None:
             print(f"Email alerts sent for this run with {candidate_count} candidates")
         elif should_send:
             print(f"Email alerts failed: {email_error}")
+            raise RuntimeError(f"Email alerts failed: {email_error}")
         elif not email_enabled:
             print("Email alerts skipped because email is disabled")
         else:
