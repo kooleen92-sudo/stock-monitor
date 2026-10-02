@@ -906,9 +906,10 @@ def save_reports(summary: pd.DataFrame, output_dir: Path, threshold: float, divi
     return csv_path, html_path, alerts_path
 
 
-def build_email_message(config: dict, html_body: str, alerts_path: Path, candidate_count: int) -> EmailMessage:
+def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: int) -> EmailMessage:
     email_cfg = config.get("email") or {}
     strategy_cfg = config.get("strategy") or {}
+    alerts_cfg = config.get("alerts") or {}
     required_keys = ["smtp_host", "smtp_port", "username", "password", "from_addr", "to_addrs"]
     missing = [key for key in required_keys if not email_cfg.get(key)]
     if missing:
@@ -916,34 +917,107 @@ def build_email_message(config: dict, html_body: str, alerts_path: Path, candida
 
     report_date = date.today().strftime("%Y-%m-%d")
     dividend_threshold = float(strategy_cfg.get("dividend_yield_threshold", 0.045))
+    percentile_threshold = float(alerts_cfg.get("percentile_threshold", 0.20))
+    strategy_mode = str(strategy_cfg.get("mode", "strict"))
+
+    candidates = summary[summary["is_watch_candidate"] == True].copy() if not summary.empty else pd.DataFrame()
+
+    text_lines = [
+        "【股票池高股息估值观察】",
+        f"日期：{report_date}",
+        f"筛选规则：主指标近 10 年分位 ≤ {percentile_threshold:.0%}，近 12 个月股息率 ≥ {dividend_threshold:.1%}",
+        f"重点观察标的数：{candidate_count} 只",
+        "-" * 45,
+    ]
+
+    html_cards = []
+    if candidates.empty:
+        text_lines.append("本次暂无标的进入重点观察区间。")
+        html_cards.append("<p style='color: #666; font-size: 15px;'>本次暂无标的进入重点观察区间。</p>")
+    else:
+        for idx, (_, row) in enumerate(candidates.iterrows(), 1):
+            name = str(row.get("display_name", ""))
+            code = str(row.get("symbol_code", ""))
+            price_val = safe_float(row.get("current_price"))
+            price = f"{price_val:.2f} 元" if price_val is not None else "无"
+            div_val = safe_float(row.get("dividend_yield"))
+            div_yield = f"{div_val:.2%}" if div_val is not None else "无"
+            div_ttm_val = safe_float(row.get("dividend_ttm"))
+            div_ttm = f"{div_ttm_val:.2f} 元" if div_ttm_val is not None else "无"
+
+            pb_val = safe_float(row.get("pb"))
+            pb = f"{pb_val:.2f}" if pb_val is not None else "无"
+            pb_pct_val = safe_float(row.get("pb_10y_percentile"))
+            pb_pct = f"{pb_pct_val:.2%}" if pb_pct_val is not None else "无"
+
+            pe_val = safe_float(row.get("pe_ttm"))
+            pe = f"{pe_val:.2f}" if pe_val is not None else "无"
+            pe_pct_val = safe_float(row.get("pe_ttm_10y_percentile"))
+            pe_pct = f"{pe_pct_val:.2%}" if pe_pct_val is not None else "无"
+
+            primary_ind = str(row.get("primary_indicator", "PB"))
+            reason = str(row.get("低估判断依据", ""))
+
+            text_lines.append(f"{idx}. {name} ({code})")
+            text_lines.append(f"   • 当前价格：{price}")
+            if primary_ind.startswith("PB"):
+                text_lines.append(f"   • 市净率 PB：{pb}（近10年分位: {pb_pct}）")
+            else:
+                text_lines.append(f"   • 市盈率 PE：{pe}（近10年分位: {pe_pct}）")
+            text_lines.append(f"   • 当前股息率：{div_yield}（近12个月每股分红: {div_ttm}）")
+            text_lines.append(f"   • 判断依据：{reason}")
+            text_lines.append("")
+
+            html_cards.append(f"""
+            <div style="background: #ffffff; border: 1px solid #e1e4e8; border-radius: 8px; padding: 16px; margin-bottom: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
+              <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #f0f0f0; padding-bottom: 8px; margin-bottom: 10px;">
+                <span style="font-size: 17px; font-weight: bold; color: #1a1a1a;">{idx}. {name} <span style="font-size: 13px; color: #586069; font-weight: normal;">({code})</span></span>
+                <span style="background: #e6ffed; color: #22863a; border: 1px solid #b4e6c0; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600;">重点观察</span>
+              </div>
+              <table style="width: 100%; border-collapse: collapse; font-size: 14px; line-height: 1.8; color: #333333;">
+                <tr><td style="width: 110px; color: #666; padding: 2px 0;">当前价格：</td><td><b style="color: #d73a49; font-size: 15px;">{price}</b></td></tr>
+                <tr><td style="color: #666; padding: 2px 0;">市净率 PB：</td><td><b>{pb}</b>（近 10 年分位：<b style="color: #0366d6;">{pb_pct}</b>）</td></tr>
+                <tr><td style="color: #666; padding: 2px 0;">滚动市盈率 PE：</td><td><b>{pe}</b>（近 10 年分位：{pe_pct}）</td></tr>
+                <tr><td style="color: #666; padding: 2px 0;">当前股息率：</td><td><b style="color: #28a745; font-size: 15px;">{div_yield}</b>（近 12 个月分红：{div_ttm}）</td></tr>
+              </table>
+              <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed #f0f0f0; color: #586069; font-size: 13px;">
+                💡 <b>依据</b>：{reason}
+              </div>
+            </div>
+            """)
+
+    text_body = "\n".join(text_lines)
+    html_body = f"""
+    <html>
+      <head><meta charset="utf-8"/></head>
+      <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f6f8fa; padding: 20px 10px; color: #24292e;">
+        <div style="max-width: 580px; margin: 0 auto;">
+          <div style="background: #24292e; color: #ffffff; padding: 16px 20px; border-radius: 8px 8px 0 0;">
+            <h2 style="margin: 0; font-size: 19px; letter-spacing: 0.5px;">📈 股票池高股息估值观察</h2>
+            <div style="font-size: 13px; color: #959da5; margin-top: 6px;">日期：{report_date} ｜ 模式：{strategy_mode} ｜ 重点标的：{candidate_count} 只</div>
+          </div>
+          <div style="background: #ffffff; border: 1px solid #e1e4e8; border-top: none; border-radius: 0 0 8px 8px; padding: 18px;">
+            <div style="background: #f1f8ff; border-left: 4px solid #0366d6; padding: 8px 12px; font-size: 13px; color: #0366d6; margin-bottom: 16px; border-radius: 0 4px 4px 0;">
+              筛选规则：主指标近 10 年分位 ≤ {percentile_threshold:.0%}，且近 12 个月股息率 ≥ {dividend_threshold:.1%}
+            </div>
+            {''.join(html_cards)}
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+
     message = EmailMessage()
-    message["Subject"] = f"股票池每日估值结果 {report_date}"
+    message["Subject"] = f"【股票估值提醒】{report_date} 共 {candidate_count} 只标的进入观察区间"
     message["From"] = email_cfg["from_addr"]
     message["To"] = ", ".join(email_cfg["to_addrs"])
-    message.set_content(
-        "\n".join(
-            [
-                f"日期：{report_date}",
-                f"本次进入重点观察区间标的数：{candidate_count}",
-                "判断口径：PB为主、股息率补充、PE辅助。",
-                f"股息率阈值：{dividend_threshold:.1%}",
-                "请查看 HTML 正文或附件 alerts.csv。",
-            ]
-        )
-    )
+    message.set_content(text_body)
     message.add_alternative(html_body, subtype="html")
-    message.add_attachment(
-        alerts_path.read_bytes(),
-        maintype="text",
-        subtype="csv",
-        filename=alerts_path.name,
-    )
     return message
 
 
-def send_email(config: dict, html_path: Path, alerts_path: Path, candidate_count: int) -> None:
-    html_body = html_path.read_text(encoding="utf-8")
-    message = build_email_message(config, html_body, alerts_path, candidate_count)
+def send_email(config: dict, summary: pd.DataFrame, candidate_count: int) -> None:
+    message = build_email_message(config, summary, candidate_count)
     email_cfg = config["email"]
 
     if email_cfg.get("use_ssl", True):
@@ -1011,7 +1085,7 @@ def main() -> None:
         email_error = None
         if should_send:
             try:
-                send_email(config, html_path, alerts_path, candidate_count)
+                send_email(config, summary, candidate_count)
             except Exception as exc:
                 email_error = exc
 
