@@ -906,6 +906,126 @@ def save_reports(summary: pd.DataFrame, output_dir: Path, threshold: float, divi
     return csv_path, html_path, alerts_path
 
 
+def get_entry_analysis(
+    code: str,
+    name: str,
+    pb: Optional[float],
+    pb_pct: Optional[float],
+    pe: Optional[float],
+    pe_pct: Optional[float],
+    div_yield: Optional[float],
+) -> dict:
+    specific_notes = {
+        "000651": {
+            "tier_name": "🥇 第一梯队（优先进场）",
+            "tier_badge": "优先进场",
+            "tier_color": "#28a745",
+            "badge_bg": "#e6ffed",
+            "badge_border": "#b4e6c0",
+            "tag": "超高股息 · 现金奶牛",
+            "highlight": "股息率逼近 8%（全池最高），历史极低估值，账面现金极充沛，分红意愿极强。",
+            "strategy": "随时可底仓配置，逢市场回调加大定投力度。",
+            "rank": 1,
+        },
+        "600036": {
+            "tier_name": "🥇 第一梯队（优先进场）",
+            "tier_badge": "优先进场",
+            "tier_color": "#28a745",
+            "badge_bg": "#e6ffed",
+            "badge_border": "#b4e6c0",
+            "tag": "零售之王 · 攻守兼备",
+            "highlight": "破净估值处于历史底部（分位 <15%），资产质量极优，兼顾近 5% 稳健股息与估值修复弹性。",
+            "strategy": "破净区间是中长线建仓黄金期，建议逢低分步买入。",
+            "rank": 2,
+        },
+        "601668": {
+            "tier_name": "🥇 第一梯队（优先进场）",
+            "tier_badge": "优先进场",
+            "tier_color": "#28a745",
+            "badge_bg": "#e6ffed",
+            "badge_border": "#b4e6c0",
+            "tag": "极限折价 · 央企基石",
+            "highlight": "PB 仅 0.36（十年分位 1.09%），安全垫极厚；股息率超 6%，海外与基建订单充沛。",
+            "strategy": "波动极小，跌无可跌，极佳的稳健吃息底仓标的。",
+            "rank": 3,
+        },
+        "601006": {
+            "tier_name": "🥈 第二梯队（观察配置）",
+            "tier_badge": "观察配置",
+            "tier_color": "#d97706",
+            "badge_bg": "#fff8c5",
+            "badge_border": "#f1e05a",
+            "tag": "类固收 · 铁路生命线",
+            "highlight": "煤运垄断通道，PB 处于历史低位，股息约 4.7%；但当前受运量影响 PE 偏高。",
+            "strategy": "可作为高息“永续债”看待，适合在 4.5~4.7 元附近逢低分批网格挂单。",
+            "rank": 4,
+        },
+        "600019": {
+            "tier_name": "🥈 第二梯队（观察配置）",
+            "tier_badge": "观察配置",
+            "tier_color": "#d97706",
+            "badge_bg": "#fff8c5",
+            "badge_border": "#f1e05a",
+            "tag": "周期博弈 · 行业龙头",
+            "highlight": "国内钢铁绝对霸主，处于行业利润周期低谷，PB 深度折价，股息超 5%。",
+            "strategy": "适合看好顺周期反转的逆向资金小仓位潜伏；纯稳健吃息首选第一梯队。",
+            "rank": 5,
+        },
+        "600941": {
+            "tier_name": "🥇 第一梯队（优先进场）",
+            "tier_badge": "优先进场",
+            "tier_color": "#28a745",
+            "badge_bg": "#e6ffed",
+            "badge_border": "#b4e6c0",
+            "tag": "通信霸主 · 稳健现金流",
+            "highlight": "护城河极深，利润与现金流极度稳定，高分红承诺。",
+            "strategy": "长线收息首选，回踩重要均线分批吸纳。",
+            "rank": 1,
+        },
+        "600900": {
+            "tier_name": "🥇 第一梯队（优先进场）",
+            "tier_badge": "优先进场",
+            "tier_color": "#28a745",
+            "badge_bg": "#e6ffed",
+            "badge_border": "#b4e6c0",
+            "tag": "水电印钞机 · 类永续债",
+            "highlight": "长江干流水电绝对垄断，来水即现金，现金分红极其慷慨。",
+            "strategy": "只要回调进入低估区间即是无脑长线配置机会。",
+            "rank": 1,
+        },
+    }
+
+    if code in specific_notes:
+        return specific_notes[code]
+
+    dy = div_yield or 0.0
+    p_pct = pb_pct if pb_pct is not None else 1.0
+    if dy >= 0.06 or (dy >= 0.048 and p_pct <= 0.10):
+        return {
+            "tier_name": "🥇 第一梯队（优先进场）",
+            "tier_badge": "优先进场",
+            "tier_color": "#28a745",
+            "badge_bg": "#e6ffed",
+            "badge_border": "#b4e6c0",
+            "tag": "深度价值 · 高确定性",
+            "highlight": f"历史估值分位处于历史底部，且股息率达 {dy:.2%}，安全边际极高。",
+            "strategy": "建议底仓配置，结合市场节奏逢低吸纳。",
+            "rank": 2,
+        }
+    else:
+        return {
+            "tier_name": "🥈 第二梯队（观察配置）",
+            "tier_badge": "观察配置",
+            "tier_color": "#d97706",
+            "badge_bg": "#fff8c5",
+            "badge_border": "#f1e05a",
+            "tag": "稳健观察 · 逢低配置",
+            "highlight": f"估值分位达标，股息率 {dy:.2%} 满足门槛，但需留意行业周期波动。",
+            "strategy": "建议保持观察，等待更低价格或分步网格轻仓介入。",
+            "rank": 6,
+        }
+
+
 def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: int) -> EmailMessage:
     email_cfg = config.get("email") or {}
     strategy_cfg = config.get("strategy") or {}
@@ -923,11 +1043,11 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
     candidates = summary[summary["is_watch_candidate"] == True].copy() if not summary.empty else pd.DataFrame()
 
     text_lines = [
-        "【股票池高股息估值观察】",
+        "【股票池高股息估值观察与进场建议】",
         f"日期：{report_date}",
         f"筛选规则：主指标近 10 年分位 ≤ {percentile_threshold:.0%}，近 12 个月股息率 ≥ {dividend_threshold:.1%}",
         f"重点观察标的数：{candidate_count} 只",
-        "-" * 45,
+        "-" * 48,
     ]
 
     html_cards = []
@@ -935,7 +1055,22 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
         text_lines.append("本次暂无标的进入重点观察区间。")
         html_cards.append("<p style='color: #666; font-size: 15px;'>本次暂无标的进入重点观察区间。</p>")
     else:
-        for idx, (_, row) in enumerate(candidates.iterrows(), 1):
+        # 对标的按照梯队优先级排序
+        enriched_list = []
+        for _, row in candidates.iterrows():
+            code = str(row.get("symbol_code", ""))
+            name = str(row.get("display_name", ""))
+            pb_val = safe_float(row.get("pb"))
+            pb_pct_val = safe_float(row.get("pb_10y_percentile"))
+            pe_val = safe_float(row.get("pe_ttm"))
+            pe_pct_val = safe_float(row.get("pe_ttm_10y_percentile"))
+            div_val = safe_float(row.get("dividend_yield"))
+            entry_info = get_entry_analysis(code, name, pb_val, pb_pct_val, pe_val, pe_pct_val, div_val)
+            enriched_list.append((entry_info["rank"], row, entry_info))
+
+        enriched_list.sort(key=lambda x: x[0])
+
+        for idx, (_, row, entry_info) in enumerate(enriched_list, 1):
             name = str(row.get("display_name", ""))
             code = str(row.get("symbol_code", ""))
             price_val = safe_float(row.get("current_price"))
@@ -956,35 +1091,50 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
             pe_pct = f"{pe_pct_val:.2%}" if pe_pct_val is not None else "无"
 
             primary_ind = str(row.get("primary_indicator", "PB"))
-            reason = str(row.get("低估判断依据", ""))
 
-            text_lines.append(f"{idx}. {name} ({code})")
+            text_lines.append(f"{idx}. {name} ({code}) 【{entry_info['tier_badge']}】")
+            text_lines.append(f"   • 标签：{entry_info['tag']}")
             text_lines.append(f"   • 当前价格：{price}")
             if primary_ind.startswith("PB"):
                 text_lines.append(f"   • 市净率 PB：{pb}（近10年分位: {pb_pct}）")
             else:
                 text_lines.append(f"   • 市盈率 PE：{pe}（近10年分位: {pe_pct}）")
             text_lines.append(f"   • 当前股息率：{div_yield}（近12个月每股分红: {div_ttm}）")
-            text_lines.append(f"   • 判断依据：{reason}")
+            text_lines.append(f"   • 核心看点：{entry_info['highlight']}")
+            text_lines.append(f"   • 进场建议：{entry_info['strategy']}")
             text_lines.append("")
 
             html_cards.append(f"""
             <div style="background: #ffffff; border: 1px solid #e1e4e8; border-radius: 8px; padding: 16px; margin-bottom: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
               <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #f0f0f0; padding-bottom: 8px; margin-bottom: 10px;">
-                <span style="font-size: 17px; font-weight: bold; color: #1a1a1a;">{idx}. {name} <span style="font-size: 13px; color: #586069; font-weight: normal;">({code})</span></span>
-                <span style="background: #e6ffed; color: #22863a; border: 1px solid #b4e6c0; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600;">重点观察</span>
+                <span style="font-size: 17px; font-weight: bold; color: #1a1a1a;">
+                  {idx}. {name} <span style="font-size: 13px; color: #586069; font-weight: normal;">({code})</span>
+                </span>
+                <span style="background: {entry_info['badge_bg']}; color: {entry_info['tier_color']}; border: 1px solid {entry_info['badge_border']}; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600;">
+                  {entry_info['tier_badge']}
+                </span>
+              </div>
+              <div style="margin-bottom: 8px; font-size: 13px; color: #0366d6; font-weight: 500;">
+                🏷️ <b>策略标签</b>：{entry_info['tag']}
               </div>
               <table style="width: 100%; border-collapse: collapse; font-size: 14px; line-height: 1.8; color: #333333;">
-                <tr><td style="width: 110px; color: #666; padding: 2px 0;">当前价格：</td><td><b style="color: #d73a49; font-size: 15px;">{price}</b></td></tr>
+                <tr><td style="width: 100px; color: #666; padding: 2px 0;">当前价格：</td><td><b style="color: #d73a49; font-size: 15px;">{price}</b></td></tr>
                 <tr><td style="color: #666; padding: 2px 0;">市净率 PB：</td><td><b>{pb}</b>（近 10 年分位：<b style="color: #0366d6;">{pb_pct}</b>）</td></tr>
                 <tr><td style="color: #666; padding: 2px 0;">滚动市盈率 PE：</td><td><b>{pe}</b>（近 10 年分位：{pe_pct}）</td></tr>
                 <tr><td style="color: #666; padding: 2px 0;">当前股息率：</td><td><b style="color: #28a745; font-size: 15px;">{div_yield}</b>（近 12 个月分红：{div_ttm}）</td></tr>
               </table>
-              <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed #f0f0f0; color: #586069; font-size: 13px;">
-                💡 <b>依据</b>：{reason}
+              <div style="margin-top: 8px; padding: 8px 10px; background: #f6f8fa; border-radius: 4px; font-size: 13px; line-height: 1.6; color: #444;">
+                <div style="margin-bottom: 4px;">🌟 <b>核心看点</b>：{entry_info['highlight']}</div>
+                <div>📌 <b>进场建议</b>：<span style="color: #b05000; font-weight: 500;">{entry_info['strategy']}</span></div>
               </div>
             </div>
             """)
+
+        text_lines.append("=" * 48)
+        text_lines.append("💡 实操进场策略指南：")
+        text_lines.append("1. 第一梯队（优先进场）：确定性与安全垫极高，适合作为核心底仓分批买入。")
+        text_lines.append("2. 第二梯队（观察配置）：受行业周期波动影响稍大，适合作为类固收或周期博弈品种逢低网格挂单。")
+        text_lines.append("3. 建仓节奏：建议采取「底仓 3~4 成 + 逢跌分批网格」策略，拒绝追高。")
 
     text_body = "\n".join(text_lines)
     html_body = f"""
@@ -993,7 +1143,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
       <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f6f8fa; padding: 20px 10px; color: #24292e;">
         <div style="max-width: 580px; margin: 0 auto;">
           <div style="background: #24292e; color: #ffffff; padding: 16px 20px; border-radius: 8px 8px 0 0;">
-            <h2 style="margin: 0; font-size: 19px; letter-spacing: 0.5px;">📈 股票池高股息估值观察</h2>
+            <h2 style="margin: 0; font-size: 19px; letter-spacing: 0.5px;">📈 股票池高股息估值观察与进场建议</h2>
             <div style="font-size: 13px; color: #959da5; margin-top: 6px;">日期：{report_date} ｜ 模式：{strategy_mode} ｜ 重点标的：{candidate_count} 只</div>
           </div>
           <div style="background: #ffffff; border: 1px solid #e1e4e8; border-top: none; border-radius: 0 0 8px 8px; padding: 18px;">
@@ -1001,6 +1151,12 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
               筛选规则：主指标近 10 年分位 ≤ {percentile_threshold:.0%}，且近 12 个月股息率 ≥ {dividend_threshold:.1%}
             </div>
             {''.join(html_cards)}
+            <div style="background: #fdf6ec; border-left: 4px solid #e6a23c; padding: 12px 14px; margin-top: 20px; border-radius: 0 4px 4px 0; font-size: 13px; line-height: 1.8; color: #5c3c00;">
+              <b>💡 实操进场策略指南：</b><br/>
+              • <b>第一梯队（优先进场）</b>：现金流与分红确定性极高，具备坚实安全垫，适合作为核心底仓分批买入。<br/>
+              • <b>第二梯队（观察配置）</b>：受宏观或行业周期影响稍大，适合作为类固收或周期博弈品种，建议逢低网格挂单。<br/>
+              • <b>建仓节奏</b>：建议采取「底仓 3~4 成 + 逢跌分批网格」策略，拒绝追高，跌出来的才是真机会。
+            </div>
           </div>
         </div>
       </body>
@@ -1008,7 +1164,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
     """
 
     message = EmailMessage()
-    message["Subject"] = f"【股票估值提醒】{report_date} 共 {candidate_count} 只标的进入观察区间"
+    message["Subject"] = f"【股票估值与进场建议】{report_date} 共 {candidate_count} 只标的进入观察区间"
     message["From"] = email_cfg["from_addr"]
     message["To"] = ", ".join(email_cfg["to_addrs"])
     message.set_content(text_body)
