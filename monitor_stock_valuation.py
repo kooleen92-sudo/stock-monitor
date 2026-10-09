@@ -13,6 +13,7 @@ from typing import Optional
 
 import akshare as ak
 import pandas as pd
+import requests
 import yaml
 
 
@@ -20,6 +21,21 @@ import yaml
 class SymbolRecord:
     symbol_code: str
     display_name: str
+
+
+@dataclass
+class IndexThermometer:
+    index_code: str
+    index_name: str
+    close_price: Optional[float]
+    pe_ttm: Optional[float]
+    pe_percentile: Optional[float]
+    dividend_yield: Optional[float]
+    temperature: Optional[float]
+    status_badge: str
+    status_color: str
+    status_bg: str
+    guidance: str
 
 
 class ConfigError(Exception):
@@ -62,6 +78,8 @@ def ensure_snapshot_columns(conn: sqlite3.Connection) -> None:
         "dividend_ttm": "ALTER TABLE symbol_snapshot ADD COLUMN dividend_ttm REAL",
         "dividend_updated_at": "ALTER TABLE symbol_snapshot ADD COLUMN dividend_updated_at TEXT",
         "consecutive_dividend_years": "ALTER TABLE symbol_snapshot ADD COLUMN consecutive_dividend_years INTEGER",
+        "dividend_yield_10y_percentile": "ALTER TABLE symbol_snapshot ADD COLUMN dividend_yield_10y_percentile REAL",
+        "dividend_yield_10y_median": "ALTER TABLE symbol_snapshot ADD COLUMN dividend_yield_10y_median REAL",
     }
     changed = False
     for column_name, sql in additions.items():
@@ -106,6 +124,23 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
             dividend_ttm REAL,
             dividend_updated_at TEXT,
             consecutive_dividend_years INTEGER,
+            dividend_yield_10y_percentile REAL,
+            dividend_yield_10y_median REAL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS index_snapshot (
+            index_code TEXT PRIMARY KEY,
+            index_name TEXT NOT NULL,
+            close_price REAL,
+            pe_ttm REAL,
+            pe_10y_percentile REAL,
+            dividend_yield REAL,
+            temperature REAL,
+            eval_text TEXT,
             updated_at TEXT NOT NULL
         )
         """
@@ -416,18 +451,38 @@ def primary_indicator_percentile(primary_indicator: str, pe_percentile: Optional
 def load_symbol_snapshot(
     conn: sqlite3.Connection,
     symbol_code: str,
-) -> tuple[Optional[str], Optional[float], Optional[str], Optional[float], Optional[float], Optional[str], Optional[int]]:
+) -> tuple[
+    Optional[str],
+    Optional[float],
+    Optional[str],
+    Optional[float],
+    Optional[float],
+    Optional[str],
+    Optional[int],
+    Optional[float],
+    Optional[float],
+]:
     row = conn.execute(
         """
-        SELECT industry, current_price, price_trade_date, dividend_yield, dividend_ttm, dividend_updated_at, consecutive_dividend_years
+        SELECT industry, current_price, price_trade_date, dividend_yield, dividend_ttm, dividend_updated_at, consecutive_dividend_years, dividend_yield_10y_percentile, dividend_yield_10y_median
         FROM symbol_snapshot
         WHERE symbol_code = ?
         """,
         (symbol_code,),
     ).fetchone()
     if row is None:
-        return None, None, None, None, None, None, None
-    industry, current_price, price_trade_date, dividend_yield, dividend_ttm, dividend_updated_at, consecutive_years = row
+        return None, None, None, None, None, None, None, None, None
+    (
+        industry,
+        current_price,
+        price_trade_date,
+        dividend_yield,
+        dividend_ttm,
+        dividend_updated_at,
+        consecutive_years,
+        div_pct,
+        div_median,
+    ) = row
     return (
         industry,
         safe_float(current_price),
@@ -436,6 +491,8 @@ def load_symbol_snapshot(
         safe_float(dividend_ttm),
         dividend_updated_at,
         int(consecutive_years) if consecutive_years is not None else None,
+        safe_float(div_pct),
+        safe_float(div_median),
     )
 
 
@@ -449,6 +506,8 @@ def upsert_symbol_snapshot(
     dividend_ttm: Optional[float],
     dividend_updated_at: Optional[str],
     consecutive_dividend_years: Optional[int],
+    dividend_yield_10y_percentile: Optional[float] = None,
+    dividend_yield_10y_median: Optional[float] = None,
 ) -> None:
     (
         existing_industry,
@@ -458,15 +517,18 @@ def upsert_symbol_snapshot(
         existing_dividend_ttm,
         existing_dividend_updated_at,
         existing_consecutive_years,
+        existing_div_pct,
+        existing_div_median,
     ) = load_symbol_snapshot(conn, symbol_code)
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
         """
         INSERT INTO symbol_snapshot (
             symbol_code, industry, current_price, price_trade_date,
-            dividend_yield, dividend_ttm, dividend_updated_at, consecutive_dividend_years, updated_at
+            dividend_yield, dividend_ttm, dividend_updated_at, consecutive_dividend_years,
+            dividend_yield_10y_percentile, dividend_yield_10y_median, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(symbol_code) DO UPDATE SET
             industry = excluded.industry,
             current_price = excluded.current_price,
@@ -475,6 +537,8 @@ def upsert_symbol_snapshot(
             dividend_ttm = excluded.dividend_ttm,
             dividend_updated_at = excluded.dividend_updated_at,
             consecutive_dividend_years = excluded.consecutive_dividend_years,
+            dividend_yield_10y_percentile = excluded.dividend_yield_10y_percentile,
+            dividend_yield_10y_median = excluded.dividend_yield_10y_median,
             updated_at = excluded.updated_at
         """,
         (
@@ -486,6 +550,8 @@ def upsert_symbol_snapshot(
             dividend_ttm if dividend_ttm is not None else existing_dividend_ttm,
             dividend_updated_at if dividend_updated_at else existing_dividend_updated_at,
             consecutive_dividend_years if consecutive_dividend_years is not None else existing_consecutive_years,
+            dividend_yield_10y_percentile if dividend_yield_10y_percentile is not None else existing_div_pct,
+            dividend_yield_10y_median if dividend_yield_10y_median is not None else existing_div_median,
             now,
         ),
     )
@@ -631,6 +697,212 @@ def dividend_passes_threshold(dividend_yield: Optional[float], dividend_threshol
     return dividend_yield >= dividend_threshold
 
 
+def fetch_dividend_yield_percentile(
+    symbol_code: str,
+    current_price: Optional[float],
+    dividend_ttm: Optional[float],
+) -> tuple[Optional[float], Optional[float]]:
+    """
+    通过东财估值走势与历史分红记录计算个股近10年股息率历史分位数及中位数
+    """
+    if not current_price or current_price <= 0 or not dividend_ttm or dividend_ttm <= 0:
+        return None, None
+
+    try:
+        div_frame = ak.stock_history_dividend_detail(symbol=symbol_code, indicator="分红")
+        if div_frame is None or div_frame.empty:
+            return None, None
+
+        ann_col = first_matching_column(list(div_frame.columns), ["公告"]) or div_frame.columns[0]
+        payout_col = first_matching_column(list(div_frame.columns), ["派息"]) or div_frame.columns[3]
+        status_col = first_matching_column(list(div_frame.columns), ["进度"])
+
+        working = div_frame.copy()
+        if status_col:
+            working = working[working[status_col].astype(str).str.contains("实施", na=False)]
+        working[ann_col] = pd.to_datetime(working[ann_col], errors="coerce")
+        working[payout_col] = pd.to_numeric(working[payout_col], errors="coerce") / 10.0
+        working = working.dropna(subset=[ann_col, payout_col]).sort_values(ann_col)
+        if working.empty:
+            return None, None
+
+        url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+        params = {
+            "sortColumns": "TRADE_DATE",
+            "sortTypes": "1",
+            "pageSize": "2500",
+            "pageNumber": "1",
+            "reportName": "RPT_VALUEANALYSIS_DET",
+            "columns": "TRADE_DATE,CLOSE_PRICE",
+            "source": "WEB",
+            "client": "WEB",
+            "filter": f'(SECURITY_CODE="{symbol_code}")',
+        }
+        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        data_json = resp.json()
+        items = (data_json.get("result") or {}).get("data") or []
+        if not items:
+            return None, None
+
+        price_df = pd.DataFrame(items)
+        price_df["TRADE_DATE"] = pd.to_datetime(price_df["TRADE_DATE"], errors="coerce")
+        price_df["CLOSE_PRICE"] = pd.to_numeric(price_df["CLOSE_PRICE"], errors="coerce")
+        price_df = price_df.dropna(subset=["TRADE_DATE", "CLOSE_PRICE"])
+
+        daily_yields = []
+        for _, row in price_df.iterrows():
+            t_date = row["TRADE_DATE"]
+            price = row["CLOSE_PRICE"]
+            if price and price > 0:
+                dps = working[(working[ann_col] <= t_date) & (working[ann_col] >= t_date - pd.Timedelta(days=365))][payout_col].sum()
+                if dps > 0:
+                    daily_yields.append(dps / price)
+
+        if not daily_yields:
+            return None, None
+
+        series = pd.Series(daily_yields)
+        curr_yield = dividend_ttm / current_price
+        pct = float((series <= curr_yield).mean())
+        median_val = float(series.median())
+        return pct, median_val
+    except Exception as exc:
+        logger.warning("Failed to calculate dividend yield percentile for %s: %s", symbol_code, exc)
+        return None, None
+
+
+def fetch_index_thermometer(conn: sqlite3.Connection, index_code: str, index_name: str) -> IndexThermometer:
+    """
+    抓取中证指数(如中证红利000922、沪深300 000300)并计算估值温度
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    cached_row = conn.execute(
+        """
+        SELECT close_price, pe_ttm, pe_10y_percentile, dividend_yield, temperature, eval_text, updated_at
+        FROM index_snapshot WHERE index_code = ?
+        """,
+        (index_code,),
+    ).fetchone()
+
+    cached_close = safe_float(cached_row[0]) if cached_row else None
+    cached_pe = safe_float(cached_row[1]) if cached_row else None
+    cached_pct = safe_float(cached_row[2]) if cached_row else None
+    cached_div = safe_float(cached_row[3]) if cached_row else None
+    cached_temp = safe_float(cached_row[4]) if cached_row else None
+
+    close_price = None
+    pe_ttm = None
+    pe_pct = None
+    div_yield = None
+
+    try:
+        start_date = (date.today() - timedelta(days=3650 + 10)).strftime("%Y%m%d")
+        end_date = date.today().strftime("%Y%m%d")
+        hist = ak.stock_zh_index_hist_csindex(symbol=index_code, start_date=start_date, end_date=end_date)
+        if hist is not None and not hist.empty and "滚动市盈率" in hist.columns:
+            pe_clean = pd.to_numeric(hist["滚动市盈率"], errors="coerce").dropna()
+            if not pe_clean.empty:
+                pe_ttm = float(pe_clean.iloc[-1])
+                pe_pct = float((pe_clean <= pe_ttm).mean())
+            if "收盘" in hist.columns:
+                close_series = pd.to_numeric(hist["收盘"], errors="coerce").dropna()
+                if not close_series.empty:
+                    close_price = float(close_series.iloc[-1])
+
+        val_df = ak.stock_zh_index_value_csindex(symbol=index_code)
+        if val_df is not None and not val_df.empty:
+            for div_col in ["股息率2", "股息率1"]:
+                if div_col in val_df.columns:
+                    val = safe_float(val_df.iloc[-1][div_col])
+                    if val is not None and val > 0:
+                        div_yield = val / 100.0
+                        break
+    except Exception as exc:
+        logger.warning("Failed to fetch live CSIndex data for %s (%s): %s", index_code, index_name, exc)
+
+    final_close = close_price if close_price is not None else cached_close
+    final_pe = pe_ttm if pe_ttm is not None else cached_pe
+    final_pct = pe_pct if pe_pct is not None else cached_pct
+    final_div = div_yield if div_yield is not None else cached_div
+    temperature = (final_pct * 100.0) if final_pct is not None else cached_temp
+
+    if temperature is not None:
+        if temperature < 30.0:
+            status_badge = "❄️ 极度严寒"
+            status_color = "#0969da"
+            status_bg = "#ddf4ff"
+            guidance = "估值处于历史大底（黄金击球区），安全边际极高，建议积极定投加仓"
+        elif temperature < 50.0:
+            status_badge = "🍃 清凉舒适"
+            status_color = "#1a7f37"
+            status_bg = "#dafbe1"
+            guidance = "估值偏低舒适，性价比较高，适合分步稳健建仓"
+        elif temperature < 70.0:
+            status_badge = "⛅ 温和均衡"
+            status_color = "#9a6700"
+            status_bg = "#fff8c5"
+            guidance = "估值合理适中，不宜追高，精选深度折价个股配置"
+        elif temperature < 85.0:
+            status_badge = "☀️ 偏暖微热"
+            status_color = "#bf8700"
+            status_bg = "#fff8c5"
+            guidance = "估值分位偏高，建议严格执行低吸策略，逢高适度防守"
+        else:
+            status_badge = "🌋 盛夏过热"
+            status_color = "#cf222e"
+            status_bg = "#ffebe9"
+            guidance = "估值处于历史顶部过热区，建议以防守和分批止盈为主"
+    else:
+        status_badge = "🌡️ 观测中"
+        status_color = "#586069"
+        status_bg = "#f6f8fa"
+        guidance = "数据同步中，保持纪律性建仓"
+
+    eval_text = f"{status_badge} - {guidance}"
+    conn.execute(
+        """
+        INSERT INTO index_snapshot (index_code, index_name, close_price, pe_ttm, pe_10y_percentile, dividend_yield, temperature, eval_text, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(index_code) DO UPDATE SET
+            close_price = excluded.close_price,
+            pe_ttm = excluded.pe_ttm,
+            pe_10y_percentile = excluded.pe_10y_percentile,
+            dividend_yield = excluded.dividend_yield,
+            temperature = excluded.temperature,
+            eval_text = excluded.eval_text,
+            updated_at = excluded.updated_at
+        """,
+        (index_code, index_name, final_close, final_pe, final_pct, final_div, temperature, eval_text, now),
+    )
+    conn.commit()
+
+    return IndexThermometer(
+        index_code=index_code,
+        index_name=index_name,
+        close_price=final_close,
+        pe_ttm=final_pe,
+        pe_percentile=final_pct,
+        dividend_yield=final_div,
+        temperature=temperature,
+        status_badge=status_badge,
+        status_color=status_color,
+        status_bg=status_bg,
+        guidance=guidance,
+    )
+
+
+def fetch_market_thermometers(conn: sqlite3.Connection) -> list[IndexThermometer]:
+    indices = [
+        ("000922", "中证红利"),
+        ("000300", "沪深300"),
+    ]
+    results = []
+    for code, name in indices:
+        thermometer = fetch_index_thermometer(conn, code, name)
+        results.append(thermometer)
+    return results
+
+
 def build_valuation_reason(
     primary_indicator: str,
     primary_percentile: Optional[float],
@@ -671,10 +943,12 @@ def build_conclusion(is_watch_candidate: bool, strategy_mode: str) -> str:
 def evaluate_dividend_quality(
     consecutive_years: Optional[int],
     payout_ratio: Optional[float],
-) -> tuple[str, str, str, bool]:
+    div_yield_10y_percentile: Optional[float] = None,
+    div_yield_10y_median: Optional[float] = None,
+) -> tuple[str, str, str, str, bool]:
     """
     评估分红质量与股息陷阱风险
-    返回: (continuity_desc, payout_desc, quality_label, is_trap)
+    返回: (continuity_desc, payout_desc, div_hist_desc, quality_label, is_trap)
     """
     if consecutive_years is not None and consecutive_years > 0:
         continuity_desc = f"连续 {consecutive_years} 年分红"
@@ -694,6 +968,19 @@ def evaluate_dividend_quality(
     else:
         payout_desc = "待测算"
 
+    if div_yield_10y_percentile is not None:
+        div_pct_str = f"{div_yield_10y_percentile:.1%}"
+        if div_yield_10y_percentile >= 0.8:
+            div_hist_desc = f"自身10年分位 {div_pct_str} (👑 极具吸引力)"
+        elif div_yield_10y_percentile >= 0.6:
+            div_hist_desc = f"自身10年分位 {div_pct_str} (🌟 偏高吸引力)"
+        elif div_yield_10y_percentile >= 0.4:
+            div_hist_desc = f"自身10年分位 {div_pct_str} (⛅ 历史适中)"
+        else:
+            div_hist_desc = f"自身10年分位 {div_pct_str} (🌱 历史偏低位)"
+    else:
+        div_hist_desc = "自身历史分位待测"
+
     is_trap = bool(payout_ratio is not None and payout_ratio > 1.0)
 
     if is_trap:
@@ -705,7 +992,7 @@ def evaluate_dividend_quality(
     else:
         quality_label = "🛡️ 排雷正常"
 
-    return continuity_desc, payout_desc, quality_label, is_trap
+    return continuity_desc, payout_desc, div_hist_desc, quality_label, is_trap
 
 
 def build_summary(
@@ -729,6 +1016,8 @@ def build_summary(
             cached_dividend_ttm,
             cached_dividend_updated_at,
             cached_consecutive_years,
+            cached_div_10y_pct,
+            cached_div_10y_median,
         ) = load_symbol_snapshot(conn, symbol.symbol_code)
         industry = fetch_industry(symbol.symbol_code) or cached_industry
         primary_indicator = suggest_primary_indicator(symbol.display_name, industry)
@@ -748,6 +1037,11 @@ def build_summary(
         if consecutive_years is None:
             consecutive_years = cached_consecutive_years
 
+        div_10y_pct = cached_div_10y_pct
+        div_10y_median = cached_div_10y_median
+        if div_10y_pct is None and current_price and dividend_ttm:
+            div_10y_pct, div_10y_median = fetch_dividend_yield_percentile(symbol.symbol_code, current_price, dividend_ttm)
+
         upsert_symbol_snapshot(
             conn,
             symbol.symbol_code,
@@ -758,13 +1052,17 @@ def build_summary(
             dividend_ttm,
             dividend_updated_at,
             consecutive_years,
+            div_10y_pct,
+            div_10y_median,
         )
         history = load_symbol_history(conn, symbol.symbol_code, start_date)
         if history.empty:
             primary_percentile = None
             dividend_ok = dividend_passes_threshold(dividend_yield, dividend_threshold)
             is_watch_candidate = False
-            continuity_desc, payout_desc, quality_label, is_trap = evaluate_dividend_quality(consecutive_years, None)
+            continuity_desc, payout_desc, div_hist_desc, quality_label, is_trap = evaluate_dividend_quality(
+                consecutive_years, None, div_10y_pct, div_10y_median
+            )
             rows.append(
                 {
                     "display_name": symbol.display_name,
@@ -783,8 +1081,11 @@ def build_summary(
                     "dividend_pass": dividend_ok,
                     "consecutive_dividend_years": consecutive_years,
                     "dividend_payout_ratio": None,
+                    "dividend_yield_10y_percentile": div_10y_pct,
+                    "dividend_yield_10y_median": div_10y_median,
                     "dividend_continuity_desc": continuity_desc,
                     "dividend_payout_desc": payout_desc,
+                    "dividend_hist_desc": div_hist_desc,
                     "dividend_quality_label": quality_label,
                     "is_dividend_trap": is_trap,
                     "主指标近10年分位": primary_percentile,
@@ -832,7 +1133,9 @@ def build_summary(
         if dividend_yield is not None and latest_pe is not None and latest_pe > 0:
             payout_ratio = float(dividend_yield * latest_pe)
 
-        continuity_desc, payout_desc, quality_label, is_trap = evaluate_dividend_quality(consecutive_years, payout_ratio)
+        continuity_desc, payout_desc, div_hist_desc, quality_label, is_trap = evaluate_dividend_quality(
+            consecutive_years, payout_ratio, div_10y_pct, div_10y_median
+        )
 
         # 目标进场价格测算
         target_price_div = None
@@ -893,8 +1196,11 @@ def build_summary(
                 "dividend_pass": dividend_ok,
                 "consecutive_dividend_years": consecutive_years,
                 "dividend_payout_ratio": payout_ratio,
+                "dividend_yield_10y_percentile": div_10y_pct,
+                "dividend_yield_10y_median": div_10y_median,
                 "dividend_continuity_desc": continuity_desc,
                 "dividend_payout_desc": payout_desc,
+                "dividend_hist_desc": div_hist_desc,
                 "dividend_quality_label": quality_label,
                 "is_dividend_trap": is_trap,
                 "主指标近10年分位": primary_percentile,
@@ -974,6 +1280,8 @@ def save_reports(summary: pd.DataFrame, output_dir: Path, threshold: float, divi
             "dividend_pass": "股息率是否达标",
             "consecutive_dividend_years": "连续分红年数",
             "dividend_payout_ratio": "股利支付率",
+            "dividend_yield_10y_percentile": "股息率近10年分位",
+            "dividend_yield_10y_median": "股息率近10年中位数",
             "dividend_quality_label": "分红排雷评估",
             "sample_size": "有效样本数",
             "pe_below_20pct": "滚动市盈率是否低估",
@@ -1003,7 +1311,7 @@ def save_reports(summary: pd.DataFrame, output_dir: Path, threshold: float, divi
         csv_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
     display_df = csv_df.copy()
-    for col in ["滚动市盈率近10年分位", "市净率近10年分位", "建议主看指标近10年分位", "市盈率市净率较低分位", "当前股息率", "距目标价所需跌幅", "股利支付率"]:
+    for col in ["滚动市盈率近10年分位", "市净率近10年分位", "建议主看指标近10年分位", "市盈率市净率较低分位", "当前股息率", "距目标价所需跌幅", "股利支付率", "股息率近10年分位", "股息率近10年中位数"]:
         if col in display_df.columns:
             display_df[col] = display_df[col].map(format_percent)
     if "连续分红年数" in display_df.columns:
@@ -1167,7 +1475,12 @@ def get_entry_analysis(
         }
 
 
-def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: int) -> EmailMessage:
+def build_email_message(
+    config: dict,
+    summary: pd.DataFrame,
+    candidate_count: int,
+    thermometers: Optional[list[IndexThermometer]] = None,
+) -> EmailMessage:
     email_cfg = config.get("email") or {}
     strategy_cfg = config.get("strategy") or {}
     alerts_cfg = config.get("alerts") or {}
@@ -1190,6 +1503,49 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
         f"重点观察标的数：{candidate_count} 只",
         "-" * 48,
     ]
+
+    if thermometers:
+        text_lines.append("🌡️【大盘与红利整体水温计】")
+        for t in thermometers:
+            div_s = f" ｜ 股息率: {t.dividend_yield:.2%}" if t.dividend_yield else ""
+            text_lines.append(f"   • {t.index_name}({t.index_code}): 水温 {t.temperature:.1f}℃ 【{t.status_badge}】 (PE: {t.pe_ttm:.2f}, 10年分位: {t.pe_percentile:.1%}{div_s})")
+            text_lines.append(f"     指导建议: {t.guidance}")
+        text_lines.append("-" * 48)
+
+    thermometers_html = ""
+    if thermometers:
+        cards_html = []
+        for t in thermometers:
+            div_val_str = f"{t.dividend_yield:.2%}" if t.dividend_yield is not None else "—"
+            cards_html.append(f"""
+            <div style="flex: 1; min-width: 240px; background: #ffffff; border: 1px solid #e1e4e8; border-radius: 6px; padding: 12px 14px; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                <span style="font-size: 15px; font-weight: bold; color: #1a1a1a;">{t.index_name} <span style="font-size: 12px; color: #586069; font-weight: normal;">({t.index_code})</span></span>
+                <span style="background: {t.status_bg}; color: {t.status_color}; border: 1px solid {t.status_color}33; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 600;">{t.status_badge}</span>
+              </div>
+              <div style="display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px;">
+                <span style="font-size: 22px; font-weight: bold; color: {t.status_color};">{t.temperature:.1f}℃</span>
+                <span style="font-size: 13px; color: #586069;">PE: <b>{t.pe_ttm:.2f}</b> (近10年分位 <b>{t.pe_percentile:.1%}</b>)</span>
+              </div>
+              <div style="font-size: 13px; color: #444; margin-bottom: 6px;">
+                指数股息率：<b style="color: #28a745;">{div_val_str}</b>
+              </div>
+              <div style="font-size: 12px; color: #586069; line-height: 1.5; border-top: 1px dashed #e1e4e8; padding-top: 6px;">
+                🧭 <b>配置建议</b>：{t.guidance}
+              </div>
+            </div>
+            """)
+        thermometers_html = f"""
+        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 16px;">
+          <div style="font-size: 14px; font-weight: bold; color: #1e293b; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between;">
+            <span>🌡️ 大盘与红利整体水温计</span>
+            <span style="font-size: 12px; color: #64748b; font-weight: normal;">水温越低估值越便宜，胜率越高</span>
+          </div>
+          <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+            {''.join(cards_html)}
+          </div>
+        </div>
+        """
 
     html_cards = []
     if candidates.empty:
@@ -1220,6 +1576,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
             div_yield = f"{div_val:.2%}" if div_val is not None else "无"
             div_ttm_val = safe_float(row.get("dividend_ttm"))
             div_ttm = f"{div_ttm_val:.2f} 元" if div_ttm_val is not None else "无"
+            div_hist_desc = str(row.get("dividend_hist_desc", ""))
 
             pb_val = safe_float(row.get("pb"))
             pb = f"{pb_val:.2f}" if pb_val is not None else "无"
@@ -1256,7 +1613,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
                 text_lines.append(f"   • 市净率 PB：{pb}（近10年分位: {pb_pct}）")
             else:
                 text_lines.append(f"   • 市盈率 PE：{pe}（近10年分位: {pe_pct}）")
-            text_lines.append(f"   • 当前股息率：{div_yield}（近12个月每股分红: {div_ttm}）")
+            text_lines.append(f"   • 当前股息率：{div_yield}（{div_hist_desc} ｜ 近12个月每股分红: {div_ttm}）")
             text_lines.append(f"   • 分红排雷：{quality_label}（{consec_str} ｜ 支付率: {payout_desc}）{trap_alert_text}")
             text_lines.append(f"   • 核心看点：{entry_info['highlight']}")
             text_lines.append(f"   • 进场建议：{entry_info['strategy']}")
@@ -1281,7 +1638,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
                 <tr><td style="color: #666; padding: 2px 0;">🎯 目标买入价：</td><td><b style="color: #0366d6;">≤ {target_str}</b> <span style="color: #28a745; font-size: 12px; font-weight: bold;">(已进入击球区 ✅)</span></td></tr>
                 <tr><td style="color: #666; padding: 2px 0;">市净率 PB：</td><td><b>{pb}</b>（近 10 年分位：<b style="color: #0366d6;">{pb_pct}</b>）</td></tr>
                 <tr><td style="color: #666; padding: 2px 0;">滚动市盈率 PE：</td><td><b>{pe}</b>（近 10 年分位：{pe_pct}）</td></tr>
-                <tr><td style="color: #666; padding: 2px 0;">当前股息率：</td><td><b style="color: #28a745; font-size: 15px;">{div_yield}</b>（近 12 个月分红：{div_ttm}）</td></tr>
+                <tr><td style="color: #666; padding: 2px 0;">当前股息率：</td><td><b style="color: #28a745; font-size: 15px;">{div_yield}</b> <span style="color: #0366d6; font-size: 12px; font-weight: 500;">({div_hist_desc})</span> <span style="color: #586069; font-size: 12px;">（近 12 个月分红：{div_ttm}）</span></td></tr>
                 <tr><td style="color: #666; padding: 2px 0;">🛡️ 分红排雷：</td><td><b style="color: {'#cb2431' if is_trap else '#28a745'};">{quality_label}</b> <span style="color: #586069; font-size: 12px;">（{consec_str} ｜ 支付率：{payout_desc}）</span></td></tr>
               </table>
               <div style="margin-top: 8px; padding: 8px 10px; background: #f6f8fa; border-radius: 4px; font-size: 13px; line-height: 1.6; color: #444;">
@@ -1327,6 +1684,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
             p_payout_val = safe_float(p_row.get("dividend_payout_ratio"))
             p_payout_str = format_percent(p_payout_val) if p_payout_val is not None else "待测"
             p_payout_desc = str(p_row.get("dividend_payout_desc", "待测算"))
+            p_div_hist = str(p_row.get("dividend_hist_desc", ""))
 
             if p_gap is not None:
                 p_gap_str = f"{p_gap:.1%}"
@@ -1350,7 +1708,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
 
             text_lines.append(f"{p_idx}. {p_name} ({p_code}) 【{p_badge}】")
             text_lines.append(f"   • 当前现价：{p_price_str} ｜ 目标买入价：{p_target_str}（还需 {p_gap_str}）")
-            text_lines.append(f"   • 分红质量：{p_consec_str}分红 ｜ 支付率: {p_payout_desc}")
+            text_lines.append(f"   • 分红质量：{p_consec_str}分红 ｜ 支付率: {p_payout_desc} ｜ {p_div_hist}")
             text_lines.append(f"   • 观察瓶颈：{p_bottle}")
             text_lines.append("")
 
@@ -1368,7 +1726,8 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
               </td>
               <td style="padding: 9px 6px; color: #444; font-size: 12px;">
                 <span>{p_consec_str}</span><br/>
-                <span style="color: #666; font-size: 11px;">支付率 {p_payout_str}</span>
+                <span style="color: #666; font-size: 11px;">支付率 {p_payout_str}</span><br/>
+                <span style="color: #0366d6; font-size: 11px;">{p_div_hist}</span>
               </td>
               <td style="padding: 9px 6px; color: #586069; font-size: 12px;">{p_bottle}</td>
             </tr>
@@ -1391,7 +1750,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
                   <th style="padding: 8px 6px;">当前现价</th>
                   <th style="padding: 8px 6px;">目标买入价</th>
                   <th style="padding: 8px 6px;">距目标价</th>
-                  <th style="padding: 8px 6px;">分红质量</th>
+                  <th style="padding: 8px 6px;">分红质量与历史分位</th>
                   <th style="padding: 8px 6px;">主要观察瓶颈</th>
                 </tr>
               </thead>
@@ -1417,6 +1776,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
             <div style="background: #f1f8ff; border-left: 4px solid #0366d6; padding: 8px 12px; font-size: 13px; color: #0366d6; margin-bottom: 16px; border-radius: 0 4px 4px 0;">
               筛选规则：主指标近 10 年分位 ≤ {percentile_threshold:.0%}，且近 12 个月股息率 ≥ {dividend_threshold:.1%}
             </div>
+            {thermometers_html}
             {''.join(html_cards)}
             <div style="background: #fdf6ec; border-left: 4px solid #e6a23c; padding: 12px 14px; margin-top: 20px; border-radius: 0 4px 4px 0; font-size: 13px; line-height: 1.8; color: #5c3c00;">
               <b>💡 实操进场策略指南：</b><br/>
@@ -1441,8 +1801,13 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
     return message
 
 
-def send_email(config: dict, summary: pd.DataFrame, candidate_count: int) -> None:
-    message = build_email_message(config, summary, candidate_count)
+def send_email(
+    config: dict,
+    summary: pd.DataFrame,
+    candidate_count: int,
+    thermometers: Optional[list[IndexThermometer]] = None,
+) -> None:
+    message = build_email_message(config, summary, candidate_count, thermometers=thermometers)
     email_cfg = config["email"]
 
     if email_cfg.get("use_ssl", True):
@@ -1457,6 +1822,12 @@ def send_email(config: dict, summary: pd.DataFrame, candidate_count: int) -> Non
 
 
 def main() -> None:
+    import sys
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -1503,6 +1874,7 @@ def main() -> None:
 
         summary = build_summary(conn, symbols, lookback_years, threshold, dividend_threshold, strategy_mode)
         csv_path, html_path, alerts_path = save_reports(summary, output_dir, threshold, dividend_threshold, strategy_mode)
+        thermometers = fetch_market_thermometers(conn)
 
         email_enabled = bool((config.get("email") or {}).get("enabled", False))
         candidate_count = int(summary["is_watch_candidate"].sum()) if not summary.empty else 0
@@ -1510,7 +1882,7 @@ def main() -> None:
         email_error = None
         if should_send:
             try:
-                send_email(config, summary, candidate_count)
+                send_email(config, summary, candidate_count, thermometers=thermometers)
             except Exception as exc:
                 email_error = exc
 
@@ -1520,6 +1892,11 @@ def main() -> None:
         print(f"Strategy mode: {strategy_mode}")
         print(f"Dividend threshold: {dividend_threshold:.2%}")
         print(f"Candidates: {candidate_count}")
+        if thermometers:
+            print("Market Thermometers:")
+            for t in thermometers:
+                div_info = f", 股息率 {t.dividend_yield:.2%}" if t.dividend_yield else ""
+                print(f"  - {t.index_name} ({t.index_code}): {t.temperature:.1f}℃ [{t.status_badge}] (PE {t.pe_ttm:.2f}, 分位 {t.pe_percentile:.1%}{div_info})")
         if should_send and email_error is None:
             print(f"Email alerts sent for this run with {candidate_count} candidates")
         elif should_send:

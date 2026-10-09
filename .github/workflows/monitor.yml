@@ -9,6 +9,8 @@ on:
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -40,6 +42,16 @@ jobs:
           STOCK_MONITOR_EMAIL_PASSWORD: ${{ secrets.STOCK_MONITOR_EMAIL_PASSWORD }}
         run: |
           python monitor_stock_valuation.py
+
+      - name: Commit and push updated database cache
+        if: always()
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data/valuation_cache.sqlite3
+          # 仅当数据库有变动时才提交，附带 [skip ci] 避免触发循环构建
+          git diff --staged --quiet || git commit -m "Update valuation database cache [skip ci]"
+          git push || echo "Push cache skipped or failed"
 
       - name: Upload Output Reports
         uses: actions/upload-artifact@v4
