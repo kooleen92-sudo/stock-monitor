@@ -735,6 +735,11 @@ def build_summary(
                     ),
                     "综合低估结论": build_conclusion(is_watch_candidate, strategy_mode),
                     "sample_size": 0,
+                    "target_entry_price": None,
+                    "target_price_div": None,
+                    "target_price_val": None,
+                    "price_gap_pct": None,
+                    "bottleneck_reason": "历史估值数据缺失",
                 }
             )
             continue
@@ -754,6 +759,51 @@ def build_summary(
             is_watch_candidate = bool(primary_ok and dividend_ok is True)
         else:
             is_watch_candidate = bool(primary_ok)
+
+        # 目标进场价格测算
+        target_price_div = None
+        if dividend_ttm and dividend_ttm > 0 and dividend_threshold > 0:
+            target_price_div = float(dividend_ttm / dividend_threshold)
+
+        target_price_val = None
+        if current_price and current_price > 0:
+            if str(primary_indicator).startswith("PB") and not pb_clean.empty and safe_float(pb_series.iloc[-1]):
+                curr_pb = float(pb_series.iloc[-1])
+                if curr_pb > 0:
+                    pb_target_val = float(pb_clean.quantile(threshold))
+                    target_price_val = float(current_price * (pb_target_val / curr_pb))
+            elif not pe_clean.empty and safe_float(pe_series.iloc[-1]):
+                curr_pe = float(pe_series.iloc[-1])
+                if curr_pe > 0:
+                    pe_target_val = float(pe_clean.quantile(threshold))
+                    target_price_val = float(current_price * (pe_target_val / curr_pe))
+
+        target_entry_price = None
+        if strategy_mode == "strict":
+            if target_price_div is not None and target_price_val is not None:
+                target_entry_price = min(target_price_div, target_price_val)
+            elif target_price_div is not None:
+                target_entry_price = target_price_div
+            elif target_price_val is not None:
+                target_entry_price = target_price_val
+        else:
+            target_entry_price = target_price_val or target_price_div
+
+        price_gap_pct = None
+        if target_entry_price is not None and current_price and current_price > 0:
+            price_gap_pct = float((target_entry_price - current_price) / current_price)
+
+        bottleneck_reason = ""
+        if not is_watch_candidate:
+            if primary_ok and not dividend_ok:
+                bottleneck_reason = f"估值分位已达标({primary_percentile:.1%})，主要等股息率达标(当前{dividend_yield:.2% if dividend_yield else '无'})"
+            elif dividend_ok and not primary_ok:
+                pct_str = f"{primary_percentile:.1%}" if primary_percentile is not None else "缺失"
+                bottleneck_reason = f"股息率达标({dividend_yield:.2%})，主要等估值分位回调至20%以内(当前{pct_str})"
+            else:
+                pct_str = f"{primary_percentile:.1%}" if primary_percentile is not None else "缺失"
+                div_str = f"{dividend_yield:.2%}" if dividend_yield is not None else "无"
+                bottleneck_reason = f"估值分位({pct_str})与股息率({div_str})均未达标，需进一步回调"
 
         rows.append(
             {
@@ -784,6 +834,11 @@ def build_summary(
                 ),
                 "综合低估结论": build_conclusion(is_watch_candidate, strategy_mode),
                 "sample_size": int(max(len(pe_clean), len(pb_clean))),
+                "target_entry_price": target_entry_price,
+                "target_price_div": target_price_div,
+                "target_price_val": target_price_val,
+                "price_gap_pct": price_gap_pct,
+                "bottleneck_reason": bottleneck_reason,
             }
         )
 
@@ -849,6 +904,9 @@ def save_reports(summary: pd.DataFrame, output_dir: Path, threshold: float, divi
             "min_percentile": "市盈率市净率较低分位",
             "低估判断依据": "低估判断依据",
             "综合低估结论": "综合低估结论",
+            "target_entry_price": "目标买入价",
+            "price_gap_pct": "距目标价所需跌幅",
+            "bottleneck_reason": "观察瓶颈说明",
         }
     )
 
@@ -866,10 +924,12 @@ def save_reports(summary: pd.DataFrame, output_dir: Path, threshold: float, divi
         csv_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
     display_df = csv_df.copy()
-    for col in ["滚动市盈率近10年分位", "市净率近10年分位", "建议主看指标近10年分位", "市盈率市净率较低分位", "当前股息率"]:
-        display_df[col] = display_df[col].map(format_percent)
-    for col in ["当前价格", "当前滚动市盈率", "当前市净率", "近12个月每股分红"]:
-        display_df[col] = display_df[col].map(format_metric)
+    for col in ["滚动市盈率近10年分位", "市净率近10年分位", "建议主看指标近10年分位", "市盈率市净率较低分位", "当前股息率", "距目标价所需跌幅"]:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].map(format_percent)
+    for col in ["当前价格", "当前滚动市盈率", "当前市净率", "近12个月每股分红", "目标买入价"]:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].map(format_metric)
 
     html_table = display_df.to_html(index=False, escape=False)
     html = f"""
@@ -1091,10 +1151,12 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
             pe_pct = f"{pe_pct_val:.2%}" if pe_pct_val is not None else "无"
 
             primary_ind = str(row.get("primary_indicator", "PB"))
+            target_val = safe_float(row.get("target_entry_price"))
+            target_str = f"{target_val:.2f} 元" if target_val is not None else "当前价"
 
             text_lines.append(f"{idx}. {name} ({code}) 【{entry_info['tier_badge']}】")
             text_lines.append(f"   • 标签：{entry_info['tag']}")
-            text_lines.append(f"   • 当前价格：{price}")
+            text_lines.append(f"   • 当前价格：{price} ｜ 目标买入价：≤ {target_str}（现价已进入击球区 ✅）")
             if primary_ind.startswith("PB"):
                 text_lines.append(f"   • 市净率 PB：{pb}（近10年分位: {pb_pct}）")
             else:
@@ -1119,6 +1181,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
               </div>
               <table style="width: 100%; border-collapse: collapse; font-size: 14px; line-height: 1.8; color: #333333;">
                 <tr><td style="width: 100px; color: #666; padding: 2px 0;">当前价格：</td><td><b style="color: #d73a49; font-size: 15px;">{price}</b></td></tr>
+                <tr><td style="color: #666; padding: 2px 0;">🎯 目标买入价：</td><td><b style="color: #0366d6;">≤ {target_str}</b> <span style="color: #28a745; font-size: 12px; font-weight: bold;">(已进入击球区 ✅)</span></td></tr>
                 <tr><td style="color: #666; padding: 2px 0;">市净率 PB：</td><td><b>{pb}</b>（近 10 年分位：<b style="color: #0366d6;">{pb_pct}</b>）</td></tr>
                 <tr><td style="color: #666; padding: 2px 0;">滚动市盈率 PE：</td><td><b>{pe}</b>（近 10 年分位：{pe_pct}）</td></tr>
                 <tr><td style="color: #666; padding: 2px 0;">当前股息率：</td><td><b style="color: #28a745; font-size: 15px;">{div_yield}</b>（近 12 个月分红：{div_ttm}）</td></tr>
@@ -1136,12 +1199,106 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
         text_lines.append("2. 第二梯队（观察配置）：受行业周期波动影响稍大，适合作为类固收或周期博弈品种逢低网格挂单。")
         text_lines.append("3. 建仓节奏：建议采取「底仓 3~4 成 + 逢跌分批网格」策略，拒绝追高。")
 
+    # 构建未达标标的的“备战清单”与目标进场价
+    pending = summary[summary["is_watch_candidate"] == False].copy() if not summary.empty else pd.DataFrame()
+    pending_html_section = ""
+    if not pending.empty:
+        if "price_gap_pct" in pending.columns:
+            pending = pending.sort_values(by="price_gap_pct", ascending=False, na_position="last")
+
+        text_lines.append("")
+        text_lines.append("-" * 48)
+        text_lines.append("🎯【潜在标的备战清单（挂单与买入点测算）】")
+        text_lines.append("（按距离目标价由近及远排列，可在券商 App 提前设置条件单）")
+        text_lines.append("")
+
+        pending_rows = []
+        for p_idx, (_, p_row) in enumerate(pending.iterrows(), 1):
+            p_name = str(p_row.get("display_name", ""))
+            p_code = str(p_row.get("symbol_code", ""))
+            p_price = safe_float(p_row.get("current_price"))
+            p_target = safe_float(p_row.get("target_entry_price"))
+            p_gap = safe_float(p_row.get("price_gap_pct"))
+            p_bottle = str(p_row.get("bottleneck_reason", ""))
+
+            p_price_str = f"{p_price:.2f} 元" if p_price is not None else "无"
+            p_target_str = f"≤ {p_target:.2f} 元" if p_target is not None else "待测算"
+
+            if p_gap is not None:
+                p_gap_str = f"{p_gap:.1%}"
+                if p_gap >= -0.06:
+                    p_badge = "🔔 即将达标"
+                    p_color = "#b05000"
+                    p_bg = "#fff8c5"
+                elif p_gap >= -0.15:
+                    p_badge = "⏳ 密切关注"
+                    p_color = "#0366d6"
+                    p_bg = "#f1f8ff"
+                else:
+                    p_badge = "🧘 耐心等待"
+                    p_color = "#586069"
+                    p_bg = "#f6f8fa"
+            else:
+                p_gap_str = "无"
+                p_badge = "观察中"
+                p_color = "#586069"
+                p_bg = "#f6f8fa"
+
+            text_lines.append(f"{p_idx}. {p_name} ({p_code}) 【{p_badge}】")
+            text_lines.append(f"   • 当前现价：{p_price_str} ｜ 目标买入价：{p_target_str}（还需 {p_gap_str}）")
+            text_lines.append(f"   • 观察瓶颈：{p_bottle}")
+            text_lines.append("")
+
+            pending_rows.append(f"""
+            <tr style="border-bottom: 1px solid #f0f0f0; font-size: 13px;">
+              <td style="padding: 9px 6px; font-weight: bold; color: #1a1a1a;">
+                {p_name} <span style="font-size: 11px; color: #666; font-weight: normal;">({p_code})</span>
+              </td>
+              <td style="padding: 9px 6px; color: #444;">{p_price_str}</td>
+              <td style="padding: 9px 6px; font-weight: bold; color: #0366d6;">{p_target_str}</td>
+              <td style="padding: 9px 6px;">
+                <span style="background: {p_bg}; color: {p_color}; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: bold;">
+                  还需 {p_gap_str}
+                </span>
+              </td>
+              <td style="padding: 9px 6px; color: #586069; font-size: 12px;">{p_bottle}</td>
+            </tr>
+            """)
+
+        pending_html_section = f"""
+        <div style="margin-top: 24px; padding-top: 16px; border-top: 2px dashed #e1e4e8;">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+            <h3 style="margin: 0; font-size: 16px; color: #1a1a1a;">🎯 潜在标的备战清单（挂单与买入点测算）</h3>
+            <span style="font-size: 12px; color: #586069;">按距离目标价由近及远排列</span>
+          </div>
+          <div style="background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 6px; padding: 8px 12px; margin-bottom: 12px; font-size: 12px; color: #586069;">
+            💡 提示：以下标的当前尚未达标，已为你倒算出触发买入信号的<b>精确击球价格</b>，可在券商 App 提前设置条件单挂单等跌。
+          </div>
+          <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+              <thead>
+                <tr style="background: #f1f3f5; color: #495057; text-align: left; font-size: 12px;">
+                  <th style="padding: 8px 6px;">标的名称</th>
+                  <th style="padding: 8px 6px;">当前现价</th>
+                  <th style="padding: 8px 6px;">目标买入价</th>
+                  <th style="padding: 8px 6px;">距目标价</th>
+                  <th style="padding: 8px 6px;">主要观察瓶颈</th>
+                </tr>
+              </thead>
+              <tbody>
+                {''.join(pending_rows)}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        """
+
     text_body = "\n".join(text_lines)
     html_body = f"""
     <html>
       <head><meta charset="utf-8"/></head>
       <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f6f8fa; padding: 20px 10px; color: #24292e;">
-        <div style="max-width: 580px; margin: 0 auto;">
+        <div style="max-width: 600px; margin: 0 auto;">
           <div style="background: #24292e; color: #ffffff; padding: 16px 20px; border-radius: 8px 8px 0 0;">
             <h2 style="margin: 0; font-size: 19px; letter-spacing: 0.5px;">📈 股票池高股息估值观察与进场建议</h2>
             <div style="font-size: 13px; color: #959da5; margin-top: 6px;">日期：{report_date} ｜ 模式：{strategy_mode} ｜ 重点标的：{candidate_count} 只</div>
@@ -1155,8 +1312,10 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
               <b>💡 实操进场策略指南：</b><br/>
               • <b>第一梯队（优先进场）</b>：现金流与分红确定性极高，具备坚实安全垫，适合作为核心底仓分批买入。<br/>
               • <b>第二梯队（观察配置）</b>：受宏观或行业周期影响稍大，适合作为类固收或周期博弈品种，建议逢低网格挂单。<br/>
-              • <b>建仓节奏</b>：建议采取「底仓 3~4 成 + 逢跌分批网格」策略，拒绝追高，跌出来的才是真机会。
+              • <b>建仓节奏</b>：建议采取「底仓 3~4 成 + 逢跌分批网格」策略，拒绝追高，跌出来的才是真机会。<br/>
+              • <b>挂单备战</b>：参考下方【备战清单】的目标价在券商设置“到价提醒”或“网格买入条件单”。
             </div>
+            {pending_html_section}
           </div>
         </div>
       </body>
