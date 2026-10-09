@@ -61,6 +61,7 @@ def ensure_snapshot_columns(conn: sqlite3.Connection) -> None:
         "dividend_yield": "ALTER TABLE symbol_snapshot ADD COLUMN dividend_yield REAL",
         "dividend_ttm": "ALTER TABLE symbol_snapshot ADD COLUMN dividend_ttm REAL",
         "dividend_updated_at": "ALTER TABLE symbol_snapshot ADD COLUMN dividend_updated_at TEXT",
+        "consecutive_dividend_years": "ALTER TABLE symbol_snapshot ADD COLUMN consecutive_dividend_years INTEGER",
     }
     changed = False
     for column_name, sql in additions.items():
@@ -104,6 +105,7 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
             dividend_yield REAL,
             dividend_ttm REAL,
             dividend_updated_at TEXT,
+            consecutive_dividend_years INTEGER,
             updated_at TEXT NOT NULL
         )
         """
@@ -414,18 +416,18 @@ def primary_indicator_percentile(primary_indicator: str, pe_percentile: Optional
 def load_symbol_snapshot(
     conn: sqlite3.Connection,
     symbol_code: str,
-) -> tuple[Optional[str], Optional[float], Optional[str], Optional[float], Optional[float], Optional[str]]:
+) -> tuple[Optional[str], Optional[float], Optional[str], Optional[float], Optional[float], Optional[str], Optional[int]]:
     row = conn.execute(
         """
-        SELECT industry, current_price, price_trade_date, dividend_yield, dividend_ttm, dividend_updated_at
+        SELECT industry, current_price, price_trade_date, dividend_yield, dividend_ttm, dividend_updated_at, consecutive_dividend_years
         FROM symbol_snapshot
         WHERE symbol_code = ?
         """,
         (symbol_code,),
     ).fetchone()
     if row is None:
-        return None, None, None, None, None, None
-    industry, current_price, price_trade_date, dividend_yield, dividend_ttm, dividend_updated_at = row
+        return None, None, None, None, None, None, None
+    industry, current_price, price_trade_date, dividend_yield, dividend_ttm, dividend_updated_at, consecutive_years = row
     return (
         industry,
         safe_float(current_price),
@@ -433,6 +435,7 @@ def load_symbol_snapshot(
         safe_float(dividend_yield),
         safe_float(dividend_ttm),
         dividend_updated_at,
+        int(consecutive_years) if consecutive_years is not None else None,
     )
 
 
@@ -445,6 +448,7 @@ def upsert_symbol_snapshot(
     dividend_yield: Optional[float],
     dividend_ttm: Optional[float],
     dividend_updated_at: Optional[str],
+    consecutive_dividend_years: Optional[int],
 ) -> None:
     (
         existing_industry,
@@ -453,15 +457,16 @@ def upsert_symbol_snapshot(
         existing_dividend_yield,
         existing_dividend_ttm,
         existing_dividend_updated_at,
+        existing_consecutive_years,
     ) = load_symbol_snapshot(conn, symbol_code)
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
         """
         INSERT INTO symbol_snapshot (
             symbol_code, industry, current_price, price_trade_date,
-            dividend_yield, dividend_ttm, dividend_updated_at, updated_at
+            dividend_yield, dividend_ttm, dividend_updated_at, consecutive_dividend_years, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(symbol_code) DO UPDATE SET
             industry = excluded.industry,
             current_price = excluded.current_price,
@@ -469,6 +474,7 @@ def upsert_symbol_snapshot(
             dividend_yield = excluded.dividend_yield,
             dividend_ttm = excluded.dividend_ttm,
             dividend_updated_at = excluded.dividend_updated_at,
+            consecutive_dividend_years = excluded.consecutive_dividend_years,
             updated_at = excluded.updated_at
         """,
         (
@@ -479,6 +485,7 @@ def upsert_symbol_snapshot(
             dividend_yield if dividend_yield is not None else existing_dividend_yield,
             dividend_ttm if dividend_ttm is not None else existing_dividend_ttm,
             dividend_updated_at if dividend_updated_at else existing_dividend_updated_at,
+            consecutive_dividend_years if consecutive_dividend_years is not None else existing_consecutive_years,
             now,
         ),
     )
@@ -521,15 +528,11 @@ def load_symbol_history(conn: sqlite3.Connection, symbol_code: str, start_date: 
 
 def percentile_of_current(series: pd.Series) -> Optional[float]:
     numeric = pd.to_numeric(series, errors="coerce")
-    if numeric.empty:
-        return None
-    current = numeric.iloc[-1]
-    if pd.isna(current) or current <= 0:
-        return None
     valid = numeric[numeric.notna() & (numeric > 0)]
     if valid.empty:
         return None
-    return float((valid <= float(current)).mean())
+    current = float(valid.iloc[-1])
+    return float((valid <= current).mean())
 
 
 def safe_float(value) -> Optional[float]:
@@ -558,13 +561,13 @@ def first_matching_column(columns: list[str], keywords: list[str]) -> Optional[s
     return None
 
 
-def fetch_dividend_metrics(symbol_code: str, current_price: Optional[float]) -> tuple[Optional[float], Optional[float], Optional[str]]:
+def fetch_dividend_metrics(symbol_code: str, current_price: Optional[float]) -> tuple[Optional[float], Optional[float], Optional[str], Optional[int]]:
     try:
         frame = ak.stock_history_dividend_detail(symbol=symbol_code, indicator="分红")
     except Exception:
-        return None, None, None
+        return None, None, None, None
     if frame is None or frame.empty:
-        return None, None, None
+        return None, None, None, None
 
     frame = normalize_cn_columns(frame)
     columns = list(frame.columns)
@@ -579,7 +582,7 @@ def fetch_dividend_metrics(symbol_code: str, current_price: Optional[float]) -> 
     if status_col is None and len(columns) >= 5:
         status_col = columns[4]
     if announcement_col is None or dividend_col is None:
-        return None, None, None
+        return None, None, None, None
 
     working = frame.copy()
     if status_col is not None:
@@ -592,11 +595,22 @@ def fetch_dividend_metrics(symbol_code: str, current_price: Optional[float]) -> 
     working[dividend_col] = pd.to_numeric(working[dividend_col], errors="coerce")
     working = working.dropna(subset=[announcement_col, dividend_col])
     if working.empty:
-        return None, None, None
+        return None, None, None, None
 
     working = working.sort_values(announcement_col).reset_index(drop=True)
     latest_date_value = working.iloc[-1][announcement_col]
     latest_date = pd.Timestamp(latest_date_value).strftime("%Y%m%d")
+
+    # 计算连续分红年数
+    dividend_years = set(
+        working[working[dividend_col] > 0][announcement_col].dt.year.dropna().astype(int).tolist()
+    )
+    current_year = date.today().year
+    consecutive_years = 0
+    check_year = current_year if current_year in dividend_years else (current_year - 1)
+    while check_year in dividend_years:
+        consecutive_years += 1
+        check_year -= 1
 
     cutoff_date = pd.Timestamp(date.today() - timedelta(days=365))
     trailing = working[working[announcement_col] >= cutoff_date].copy()
@@ -605,10 +619,10 @@ def fetch_dividend_metrics(symbol_code: str, current_price: Optional[float]) -> 
 
     dividend_ttm = safe_float(trailing[dividend_col].sum() / 10.0)
     if dividend_ttm is None or dividend_ttm <= 0 or current_price is None or current_price <= 0:
-        return None, dividend_ttm, latest_date
+        return None, dividend_ttm, latest_date, consecutive_years
 
     dividend_yield = dividend_ttm / current_price
-    return dividend_yield, dividend_ttm, latest_date
+    return dividend_yield, dividend_ttm, latest_date, consecutive_years
 
 
 def dividend_passes_threshold(dividend_yield: Optional[float], dividend_threshold: float) -> Optional[bool]:
@@ -654,6 +668,46 @@ def build_conclusion(is_watch_candidate: bool, strategy_mode: str) -> str:
     return "暂未进入重点观察区间"
 
 
+def evaluate_dividend_quality(
+    consecutive_years: Optional[int],
+    payout_ratio: Optional[float],
+) -> tuple[str, str, str, bool]:
+    """
+    评估分红质量与股息陷阱风险
+    返回: (continuity_desc, payout_desc, quality_label, is_trap)
+    """
+    if consecutive_years is not None and consecutive_years > 0:
+        continuity_desc = f"连续 {consecutive_years} 年分红"
+    else:
+        continuity_desc = "分红记录偏短/暂无"
+
+    if payout_ratio is not None and payout_ratio > 0:
+        pct_str = f"{payout_ratio:.1%}"
+        if payout_ratio > 1.0:
+            payout_desc = f"{pct_str} (⚠️ 掏空利润)"
+        elif payout_ratio > 0.8:
+            payout_desc = f"{pct_str} (⚡ 缓冲偏小)"
+        elif payout_ratio >= 0.3:
+            payout_desc = f"{pct_str} (💎 黄金区间)"
+        else:
+            payout_desc = f"{pct_str} (🌱 留存充裕)"
+    else:
+        payout_desc = "待测算"
+
+    is_trap = bool(payout_ratio is not None and payout_ratio > 1.0)
+
+    if is_trap:
+        quality_label = "🚨 警惕股息陷阱（支付率超 100%，利润难以为继）"
+    elif consecutive_years is not None and consecutive_years >= 10 and payout_ratio is not None and 0.3 <= payout_ratio <= 0.8:
+        quality_label = "🛡️ 优质高息 · 黄金分红（排雷满分）"
+    elif consecutive_years is not None and consecutive_years >= 5:
+        quality_label = "🛡️ 持续回馈 · 排雷正常"
+    else:
+        quality_label = "🛡️ 排雷正常"
+
+    return continuity_desc, payout_desc, quality_label, is_trap
+
+
 def build_summary(
     conn: sqlite3.Connection,
     symbols: list[SymbolRecord],
@@ -674,6 +728,7 @@ def build_summary(
             cached_dividend_yield,
             cached_dividend_ttm,
             cached_dividend_updated_at,
+            cached_consecutive_years,
         ) = load_symbol_snapshot(conn, symbol.symbol_code)
         industry = fetch_industry(symbol.symbol_code) or cached_industry
         primary_indicator = suggest_primary_indicator(symbol.display_name, industry)
@@ -683,13 +738,15 @@ def build_summary(
         if not price_trade_date:
             price_trade_date = cached_price_trade_date
 
-        dividend_yield, dividend_ttm, dividend_updated_at = fetch_dividend_metrics(symbol.symbol_code, current_price)
+        dividend_yield, dividend_ttm, dividend_updated_at, consecutive_years = fetch_dividend_metrics(symbol.symbol_code, current_price)
         if dividend_yield is None:
             dividend_yield = cached_dividend_yield
         if dividend_ttm is None:
             dividend_ttm = cached_dividend_ttm
         if not dividend_updated_at:
             dividend_updated_at = cached_dividend_updated_at
+        if consecutive_years is None:
+            consecutive_years = cached_consecutive_years
 
         upsert_symbol_snapshot(
             conn,
@@ -700,12 +757,14 @@ def build_summary(
             dividend_yield,
             dividend_ttm,
             dividend_updated_at,
+            consecutive_years,
         )
         history = load_symbol_history(conn, symbol.symbol_code, start_date)
         if history.empty:
             primary_percentile = None
             dividend_ok = dividend_passes_threshold(dividend_yield, dividend_threshold)
             is_watch_candidate = False
+            continuity_desc, payout_desc, quality_label, is_trap = evaluate_dividend_quality(consecutive_years, None)
             rows.append(
                 {
                     "display_name": symbol.display_name,
@@ -722,6 +781,12 @@ def build_summary(
                     "dividend_ttm": dividend_ttm,
                     "dividend_updated_at": dividend_updated_at,
                     "dividend_pass": dividend_ok,
+                    "consecutive_dividend_years": consecutive_years,
+                    "dividend_payout_ratio": None,
+                    "dividend_continuity_desc": continuity_desc,
+                    "dividend_payout_desc": payout_desc,
+                    "dividend_quality_label": quality_label,
+                    "is_dividend_trap": is_trap,
                     "主指标近10年分位": primary_percentile,
                     "is_watch_candidate": is_watch_candidate,
                     "低估判断依据": build_valuation_reason(
@@ -750,6 +815,8 @@ def build_summary(
         pb_series = pd.to_numeric(history["pb"], errors="coerce")
         pe_clean = pe_series[pe_series.notna() & (pe_series > 0)]
         pb_clean = pb_series[pb_series.notna() & (pb_series > 0)]
+        latest_pe = safe_float(pe_clean.iloc[-1]) if not pe_clean.empty else None
+        latest_pb = safe_float(pb_clean.iloc[-1]) if not pb_clean.empty else None
         pe_percentile = percentile_of_current(pe_series)
         pb_percentile = percentile_of_current(pb_series)
         primary_percentile = primary_indicator_percentile(primary_indicator, pe_percentile, pb_percentile)
@@ -760,6 +827,13 @@ def build_summary(
         else:
             is_watch_candidate = bool(primary_ok)
 
+        # 股利支付率与分红排雷评估
+        payout_ratio = None
+        if dividend_yield is not None and latest_pe is not None and latest_pe > 0:
+            payout_ratio = float(dividend_yield * latest_pe)
+
+        continuity_desc, payout_desc, quality_label, is_trap = evaluate_dividend_quality(consecutive_years, payout_ratio)
+
         # 目标进场价格测算
         target_price_div = None
         if dividend_ttm and dividend_ttm > 0 and dividend_threshold > 0:
@@ -767,16 +841,12 @@ def build_summary(
 
         target_price_val = None
         if current_price and current_price > 0:
-            if str(primary_indicator).startswith("PB") and not pb_clean.empty and safe_float(pb_series.iloc[-1]):
-                curr_pb = float(pb_series.iloc[-1])
-                if curr_pb > 0:
-                    pb_target_val = float(pb_clean.quantile(threshold))
-                    target_price_val = float(current_price * (pb_target_val / curr_pb))
-            elif not pe_clean.empty and safe_float(pe_series.iloc[-1]):
-                curr_pe = float(pe_series.iloc[-1])
-                if curr_pe > 0:
-                    pe_target_val = float(pe_clean.quantile(threshold))
-                    target_price_val = float(current_price * (pe_target_val / curr_pe))
+            if str(primary_indicator).startswith("PB") and not pb_clean.empty and latest_pb and latest_pb > 0:
+                pb_target_val = float(pb_clean.quantile(threshold))
+                target_price_val = float(current_price * (pb_target_val / latest_pb))
+            elif not pe_clean.empty and latest_pe and latest_pe > 0:
+                pe_target_val = float(pe_clean.quantile(threshold))
+                target_price_val = float(current_price * (pe_target_val / latest_pe))
 
         target_entry_price = None
         if strategy_mode == "strict":
@@ -813,14 +883,20 @@ def build_summary(
                 "primary_indicator": primary_indicator,
                 "latest_trade_date": latest_trade_date,
                 "current_price": current_price,
-                "pe_ttm": safe_float(pe_series.iloc[-1]),
+                "pe_ttm": latest_pe,
                 "pe_ttm_10y_percentile": pe_percentile,
-                "pb": safe_float(pb_series.iloc[-1]),
+                "pb": latest_pb,
                 "pb_10y_percentile": pb_percentile,
                 "dividend_yield": dividend_yield,
                 "dividend_ttm": dividend_ttm,
                 "dividend_updated_at": dividend_updated_at,
                 "dividend_pass": dividend_ok,
+                "consecutive_dividend_years": consecutive_years,
+                "dividend_payout_ratio": payout_ratio,
+                "dividend_continuity_desc": continuity_desc,
+                "dividend_payout_desc": payout_desc,
+                "dividend_quality_label": quality_label,
+                "is_dividend_trap": is_trap,
                 "主指标近10年分位": primary_percentile,
                 "is_watch_candidate": is_watch_candidate,
                 "低估判断依据": build_valuation_reason(
@@ -896,6 +972,9 @@ def save_reports(summary: pd.DataFrame, output_dir: Path, threshold: float, divi
             "dividend_ttm": "近12个月每股分红",
             "dividend_updated_at": "股息数据更新日",
             "dividend_pass": "股息率是否达标",
+            "consecutive_dividend_years": "连续分红年数",
+            "dividend_payout_ratio": "股利支付率",
+            "dividend_quality_label": "分红排雷评估",
             "sample_size": "有效样本数",
             "pe_below_20pct": "滚动市盈率是否低估",
             "pb_below_20pct": "市净率是否低估",
@@ -910,7 +989,7 @@ def save_reports(summary: pd.DataFrame, output_dir: Path, threshold: float, divi
         }
     )
 
-    for col in ["所属行业", "建议主看指标", "低估判断依据", "综合低估结论", "股息数据更新日"]:
+    for col in ["所属行业", "建议主看指标", "低估判断依据", "综合低估结论", "股息数据更新日", "分红排雷评估"]:
         if col in csv_df.columns:
             csv_df[col] = csv_df[col].fillna("")
     for col in ["滚动市盈率是否低估", "市净率是否低估", "是否进入重点观察区间", "股息率是否达标"]:
@@ -924,9 +1003,11 @@ def save_reports(summary: pd.DataFrame, output_dir: Path, threshold: float, divi
         csv_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
     display_df = csv_df.copy()
-    for col in ["滚动市盈率近10年分位", "市净率近10年分位", "建议主看指标近10年分位", "市盈率市净率较低分位", "当前股息率", "距目标价所需跌幅"]:
+    for col in ["滚动市盈率近10年分位", "市净率近10年分位", "建议主看指标近10年分位", "市盈率市净率较低分位", "当前股息率", "距目标价所需跌幅", "股利支付率"]:
         if col in display_df.columns:
             display_df[col] = display_df[col].map(format_percent)
+    if "连续分红年数" in display_df.columns:
+        display_df["连续分红年数"] = display_df["连续分红年数"].map(lambda v: f"{int(v)}年" if pd.notna(v) and v is not None and str(v) != "" else "")
     for col in ["当前价格", "当前滚动市盈率", "当前市净率", "近12个月每股分红", "目标买入价"]:
         if col in display_df.columns:
             display_df[col] = display_df[col].map(format_metric)
@@ -1154,6 +1235,20 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
             target_val = safe_float(row.get("target_entry_price"))
             target_str = f"{target_val:.2f} 元" if target_val is not None else "当前价"
 
+            # 分红排雷与质量评估
+            consec_val = row.get("consecutive_dividend_years")
+            consec_str = f"连续 {int(consec_val)} 年分红" if consec_val is not None and pd.notna(consec_val) and int(consec_val) > 0 else "分红记录偏短"
+            payout_desc = str(row.get("dividend_payout_desc", "待测算"))
+            quality_label = str(row.get("dividend_quality_label", "🛡️ 排雷正常"))
+            is_trap = bool(row.get("is_dividend_trap", False))
+
+            trap_alert_text = "\n   • ⚠️【股息陷阱警报】：支付率超 100%，净利润无法覆盖分红，谨防本金亏损！" if is_trap else ""
+            trap_alert_html = """
+              <div style="background: #ffeef0; color: #cb2431; border: 1px solid #fdaeb7; padding: 6px 10px; border-radius: 4px; font-size: 13px; font-weight: 600; margin-bottom: 8px;">
+                ⚠️ 股息陷阱警报：该标的股利支付率超过 100%，净利润无法覆盖分红，需谨防分红不可持续及本金损失风险！
+              </div>
+            """ if is_trap else ""
+
             text_lines.append(f"{idx}. {name} ({code}) 【{entry_info['tier_badge']}】")
             text_lines.append(f"   • 标签：{entry_info['tag']}")
             text_lines.append(f"   • 当前价格：{price} ｜ 目标买入价：≤ {target_str}（现价已进入击球区 ✅）")
@@ -1162,6 +1257,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
             else:
                 text_lines.append(f"   • 市盈率 PE：{pe}（近10年分位: {pe_pct}）")
             text_lines.append(f"   • 当前股息率：{div_yield}（近12个月每股分红: {div_ttm}）")
+            text_lines.append(f"   • 分红排雷：{quality_label}（{consec_str} ｜ 支付率: {payout_desc}）{trap_alert_text}")
             text_lines.append(f"   • 核心看点：{entry_info['highlight']}")
             text_lines.append(f"   • 进场建议：{entry_info['strategy']}")
             text_lines.append("")
@@ -1176,6 +1272,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
                   {entry_info['tier_badge']}
                 </span>
               </div>
+              {trap_alert_html}
               <div style="margin-bottom: 8px; font-size: 13px; color: #0366d6; font-weight: 500;">
                 🏷️ <b>策略标签</b>：{entry_info['tag']}
               </div>
@@ -1185,6 +1282,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
                 <tr><td style="color: #666; padding: 2px 0;">市净率 PB：</td><td><b>{pb}</b>（近 10 年分位：<b style="color: #0366d6;">{pb_pct}</b>）</td></tr>
                 <tr><td style="color: #666; padding: 2px 0;">滚动市盈率 PE：</td><td><b>{pe}</b>（近 10 年分位：{pe_pct}）</td></tr>
                 <tr><td style="color: #666; padding: 2px 0;">当前股息率：</td><td><b style="color: #28a745; font-size: 15px;">{div_yield}</b>（近 12 个月分红：{div_ttm}）</td></tr>
+                <tr><td style="color: #666; padding: 2px 0;">🛡️ 分红排雷：</td><td><b style="color: {'#cb2431' if is_trap else '#28a745'};">{quality_label}</b> <span style="color: #586069; font-size: 12px;">（{consec_str} ｜ 支付率：{payout_desc}）</span></td></tr>
               </table>
               <div style="margin-top: 8px; padding: 8px 10px; background: #f6f8fa; border-radius: 4px; font-size: 13px; line-height: 1.6; color: #444;">
                 <div style="margin-bottom: 4px;">🌟 <b>核心看点</b>：{entry_info['highlight']}</div>
@@ -1224,6 +1322,12 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
             p_price_str = f"{p_price:.2f} 元" if p_price is not None else "无"
             p_target_str = f"≤ {p_target:.2f} 元" if p_target is not None else "待测算"
 
+            p_consec_val = p_row.get("consecutive_dividend_years")
+            p_consec_str = f"连续 {int(p_consec_val)} 年" if p_consec_val is not None and pd.notna(p_consec_val) and int(p_consec_val) > 0 else "记录偏短"
+            p_payout_val = safe_float(p_row.get("dividend_payout_ratio"))
+            p_payout_str = format_percent(p_payout_val) if p_payout_val is not None else "待测"
+            p_payout_desc = str(p_row.get("dividend_payout_desc", "待测算"))
+
             if p_gap is not None:
                 p_gap_str = f"{p_gap:.1%}"
                 if p_gap >= -0.06:
@@ -1246,6 +1350,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
 
             text_lines.append(f"{p_idx}. {p_name} ({p_code}) 【{p_badge}】")
             text_lines.append(f"   • 当前现价：{p_price_str} ｜ 目标买入价：{p_target_str}（还需 {p_gap_str}）")
+            text_lines.append(f"   • 分红质量：{p_consec_str}分红 ｜ 支付率: {p_payout_desc}")
             text_lines.append(f"   • 观察瓶颈：{p_bottle}")
             text_lines.append("")
 
@@ -1260,6 +1365,10 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
                 <span style="background: {p_bg}; color: {p_color}; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: bold;">
                   还需 {p_gap_str}
                 </span>
+              </td>
+              <td style="padding: 9px 6px; color: #444; font-size: 12px;">
+                <span>{p_consec_str}</span><br/>
+                <span style="color: #666; font-size: 11px;">支付率 {p_payout_str}</span>
               </td>
               <td style="padding: 9px 6px; color: #586069; font-size: 12px;">{p_bottle}</td>
             </tr>
@@ -1282,6 +1391,7 @@ def build_email_message(config: dict, summary: pd.DataFrame, candidate_count: in
                   <th style="padding: 8px 6px;">当前现价</th>
                   <th style="padding: 8px 6px;">目标买入价</th>
                   <th style="padding: 8px 6px;">距目标价</th>
+                  <th style="padding: 8px 6px;">分红质量</th>
                   <th style="padding: 8px 6px;">主要观察瓶颈</th>
                 </tr>
               </thead>
