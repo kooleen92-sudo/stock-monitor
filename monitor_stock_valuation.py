@@ -1475,19 +1475,15 @@ def get_entry_analysis(
         }
 
 
-def build_email_message(
+def render_email_content(
     config: dict,
     summary: pd.DataFrame,
     candidate_count: int,
     thermometers: Optional[list[IndexThermometer]] = None,
-) -> EmailMessage:
-    email_cfg = config.get("email") or {}
+    image_path: Optional[Path] = None,
+) -> tuple[str, str, str]:
     strategy_cfg = config.get("strategy") or {}
     alerts_cfg = config.get("alerts") or {}
-    required_keys = ["smtp_host", "smtp_port", "username", "password", "from_addr", "to_addrs"]
-    missing = [key for key in required_keys if not email_cfg.get(key)]
-    if missing:
-        raise ConfigError(f"Missing email config keys: {', '.join(missing)}")
 
     report_date = date.today().strftime("%Y-%m-%d")
     dividend_threshold = float(strategy_cfg.get("dividend_yield_threshold", 0.045))
@@ -1763,7 +1759,7 @@ def build_email_message(
         """
 
     text_body = "\n".join(text_lines)
-    html_body = f"""
+    html_body_card = f"""
     <html>
       <head><meta charset="utf-8"/></head>
       <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f6f8fa; padding: 20px 10px; color: #24292e;">
@@ -1792,13 +1788,91 @@ def build_email_message(
     </html>
     """
 
+    email_html = html_body_card
+    if image_path and image_path.exists():
+        text_lines.append("")
+        text_lines.append("📎【附件提醒】：已随信附送《高股息估值观察高清长图》，可在邮件附件中查阅或长按保存。")
+        text_body = "\n".join(text_lines)
+
+        image_preview_section = """
+            <div style="margin-top: 24px; padding-top: 16px; border-top: 2px dashed #e1e4e8; text-align: center;">
+              <div style="font-size: 14px; font-weight: bold; color: #1a1a1a; margin-bottom: 6px;">📱 高清手机长图（长按图片可保存至相册 / 转发分享）</div>
+              <div style="font-size: 12px; color: #586069; margin-bottom: 12px;">已同步生成高清手机长图并作为邮件附件，方便在手机相册或微信中随时查阅</div>
+              <img src="cid:valuation_card_image" style="max-width: 100%; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); border: 1px solid #e1e4e8;" alt="高股息估值观察长图" />
+            </div>
+        """
+        email_html = html_body_card.replace(
+            "</div>\n        </div>\n      </body>",
+            f"{image_preview_section}\n          </div>\n        </div>\n      </body>",
+        )
+
+    return email_html, text_body, report_date
+
+
+def build_email_message(
+    config: dict,
+    summary: pd.DataFrame,
+    candidate_count: int,
+    thermometers: Optional[list[IndexThermometer]] = None,
+    image_path: Optional[Path] = None,
+) -> EmailMessage:
+    email_cfg = config.get("email") or {}
+    required_keys = ["smtp_host", "smtp_port", "username", "password", "from_addr", "to_addrs"]
+    missing = [key for key in required_keys if not email_cfg.get(key)]
+    if missing:
+        raise ConfigError(f"Missing email config keys: {', '.join(missing)}")
+
+    email_html, text_body, report_date = render_email_content(
+        config, summary, candidate_count, thermometers=thermometers, image_path=image_path
+    )
+
     message = EmailMessage()
     message["Subject"] = f"【股票估值与进场建议】{report_date} 共 {candidate_count} 只标的进入观察区间"
     message["From"] = email_cfg["from_addr"]
     message["To"] = ", ".join(email_cfg["to_addrs"])
     message.set_content(text_body)
-    message.add_alternative(html_body, subtype="html")
+    message.add_alternative(email_html, subtype="html")
+
+    if image_path and image_path.exists():
+        img_data = image_path.read_bytes()
+        # 1. 关联至 HTML 内嵌显示
+        message.get_payload()[-1].add_related(
+            img_data,
+            maintype="image",
+            subtype="png",
+            cid="<valuation_card_image>",
+            filename=f"高股息估值观察长图_{report_date}.png",
+            disposition="inline",
+        )
+        # 2. 同时作为独立附件提供，方便一键保存至相册
+        message.add_attachment(
+            img_data,
+            maintype="image",
+            subtype="png",
+            filename=f"高股息估值观察长图_{report_date}.png",
+        )
+
     return message
+
+
+def generate_long_image(html_content: str, output_path: Path) -> Optional[Path]:
+    """
+    使用 Playwright 将 HTML 内容渲染并导出为高清晰度移动端长图 (Retina 2x)
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            # 640px 手机卡片标准宽度，Retina 2x 缩放，保证手机端极度清晰
+            page = browser.new_page(viewport={"width": 640, "height": 800}, device_scale_factor=2)
+            page.set_content(html_content, wait_until="networkidle")
+            page.screenshot(path=str(output_path), full_page=True)
+            browser.close()
+        logger.info("Successfully generated mobile long image at %s", output_path)
+        return output_path
+    except Exception as exc:
+        logger.warning("Could not generate long image via Playwright: %s", exc)
+        return None
 
 
 def send_email(
@@ -1806,8 +1880,9 @@ def send_email(
     summary: pd.DataFrame,
     candidate_count: int,
     thermometers: Optional[list[IndexThermometer]] = None,
+    image_path: Optional[Path] = None,
 ) -> None:
-    message = build_email_message(config, summary, candidate_count, thermometers=thermometers)
+    message = build_email_message(config, summary, candidate_count, thermometers=thermometers, image_path=image_path)
     email_cfg = config["email"]
 
     if email_cfg.get("use_ssl", True):
@@ -1875,20 +1950,37 @@ def main() -> None:
         summary = build_summary(conn, symbols, lookback_years, threshold, dividend_threshold, strategy_mode)
         csv_path, html_path, alerts_path = save_reports(summary, output_dir, threshold, dividend_threshold, strategy_mode)
         thermometers = fetch_market_thermometers(conn)
+        candidate_count = int(summary["is_watch_candidate"].sum()) if not summary.empty else 0
+
+        # 生成与导出移动端高清长图与卡片 HTML
+        card_image_path = output_dir / "valuation_card.png"
+        card_html_path = output_dir / "valuation_card.html"
+        long_image_file = None
+        try:
+            card_html, _, _ = render_email_content(
+                config, summary, candidate_count, thermometers=thermometers, image_path=None
+            )
+            card_html_path.write_text(card_html, encoding="utf-8")
+            long_image_file = generate_long_image(card_html, card_image_path)
+        except Exception as exc:
+            logger.warning("Failed to prepare card HTML or long image: %s", exc)
 
         email_enabled = bool((config.get("email") or {}).get("enabled", False))
-        candidate_count = int(summary["is_watch_candidate"].sum()) if not summary.empty else 0
         should_send = email_enabled and (not args.skip_email)
         email_error = None
         if should_send:
             try:
-                send_email(config, summary, candidate_count, thermometers=thermometers)
+                send_email(config, summary, candidate_count, thermometers=thermometers, image_path=long_image_file)
             except Exception as exc:
                 email_error = exc
 
         print(f"Saved CSV: {csv_path}")
         print(f"Saved HTML: {html_path}")
         print(f"Saved alerts: {alerts_path}")
+        if card_html_path.exists():
+            print(f"Saved Card HTML: {card_html_path}")
+        if long_image_file and long_image_file.exists():
+            print(f"Saved Long Image: {long_image_file}")
         print(f"Strategy mode: {strategy_mode}")
         print(f"Dividend threshold: {dividend_threshold:.2%}")
         print(f"Candidates: {candidate_count}")

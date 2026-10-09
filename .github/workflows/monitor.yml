@@ -31,10 +31,12 @@ jobs:
           restore-keys: |
             stock-db-
 
-      - name: Install dependencies
+      - name: Install dependencies and browser
         run: |
+          sudo apt-get update && sudo apt-get install -y fonts-wqy-microhei fonts-wqy-zenhei
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
 
       - name: Run Stock Monitor
         env:
