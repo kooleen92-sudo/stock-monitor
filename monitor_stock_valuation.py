@@ -1169,7 +1169,8 @@ def build_summary(
         bottleneck_reason = ""
         if not is_watch_candidate:
             if primary_ok and not dividend_ok:
-                bottleneck_reason = f"估值分位已达标({primary_percentile:.1%})，主要等股息率达标(当前{dividend_yield:.2% if dividend_yield else '无'})"
+                div_str = f"{dividend_yield:.2%}" if dividend_yield is not None else "无"
+                bottleneck_reason = f"估值分位已达标({primary_percentile:.1%})，主要等股息率达标(当前{div_str})"
             elif dividend_ok and not primary_ok:
                 pct_str = f"{primary_percentile:.1%}" if primary_percentile is not None else "缺失"
                 bottleneck_reason = f"股息率达标({dividend_yield:.2%})，主要等估值分位回调至20%以内(当前{pct_str})"
